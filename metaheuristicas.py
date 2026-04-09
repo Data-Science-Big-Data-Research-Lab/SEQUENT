@@ -1,20 +1,3 @@
-"""
-metaheuristicas.py
-==================
-Two metaheuristic optimisers for binary-vector search spaces.
-
-Both share the same interface so they are interchangeable in run_experiment:
-
-    best_solution, solutions_dict = optimiser(
-        objective_function,   # f(vector) -> (cost: float, aux: any)
-        chromosome_length,    # int
-        **kwargs
-    )
-
-The objective_function must be *minimised* (lower cost = better).
-Since we maximise accuracy, pass  cost = -accuracy.
-"""
-
 import random
 import math
 import numpy as np

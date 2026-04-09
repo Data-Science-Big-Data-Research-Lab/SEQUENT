@@ -36,8 +36,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, classification_report)
 from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from pmlb import fetch_data
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 os.environ["QISKIT_AER_CPU_THREADS"] = str(os.cpu_count())
 os.environ["QISKIT_AER_CUQUANTUM"] = "1"
@@ -91,31 +96,224 @@ def load_data(path=None, option=0, dataset=None):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  FEATURE SELECTION  (R2-13: ANOVA vs mutual info)
+#  FEATURE SELECTION  (R2-13: ANOVA vs mutual info vs autoencoder)
 # ═══════════════════════════════════════════════════════════════
 
-def apply_feature_selection(X, y, method="anova", k=5):
+# ── Autoencoder architecture ─────────────────────────────────────────────────
+
+class _Autoencoder(nn.Module):
     """
-    method : 'anova'       — F-score (fast, linear relationships only).
-             'mutual_info' — MI estimator (captures non-linear dependencies).
-             'autoencoder' — placeholder for future work.
+    Symmetric autoencoder for unsupervised feature compression.
+
+    Architecture
+    ────────────
+    Encoder : n_features → hidden_dim → latent_dim (k)
+    Decoder : k          → hidden_dim → n_features
+
+    The latent layer uses no activation so the latent space is unbounded
+    and can represent both positive and negative feature interactions.
+    All other layers use ReLU + BatchNorm for stable training.
+
+    Parameters
+    ----------
+    n_features  : int — number of input features
+    latent_dim  : int — target number of latent dimensions (= k)
+    hidden_dim  : int — size of the intermediate hidden layer
+    """
+
+    def __init__(self, n_features: int, latent_dim: int, hidden_dim: int):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(n_features, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            # No activation: latent space must remain unconstrained
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_features),
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+    def encode(self, x):
+        return self.encoder(x)
+
+
+def _train_autoencoder(
+    X_scaled: np.ndarray,
+    latent_dim: int,
+    hidden_dim: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    patience: int,
+    device: torch.device,
+    seed: int,
+) -> _Autoencoder:
+    """
+    Trains the autoencoder with MSE reconstruction loss, Adam optimiser
+    and early stopping on a held-out validation split (10% of data).
+
+    Returns the trained model in eval() mode.
+    """
+    torch.manual_seed(seed)
+
+    n, n_feat = X_scaled.shape
+    val_size  = max(1, int(0.1 * n))
+    idx       = np.random.permutation(n)
+    tr_idx, val_idx = idx[val_size:], idx[:val_size]
+
+    X_tr  = torch.tensor(X_scaled[tr_idx],  dtype=torch.float32, device=device)
+    X_val = torch.tensor(X_scaled[val_idx], dtype=torch.float32, device=device)
+
+    loader = DataLoader(TensorDataset(X_tr, X_tr),
+                        batch_size=min(batch_size, len(tr_idx)),
+                        shuffle=True)
+
+    model = _Autoencoder(n_feat, latent_dim, hidden_dim).to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    loss_fn = nn.MSELoss()
+
+    best_val_loss = float("inf")
+    best_state    = None
+    wait          = 0
+
+    model.train()
+    for epoch in range(1, epochs + 1):
+        for xb, _ in loader:
+            opt.zero_grad()
+            loss_fn(model(xb), xb).backward()
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = loss_fn(model(X_val), X_val).item()
+        model.train()
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
+            wait          = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"    → early stop at epoch {epoch}  "
+                      f"(best val_loss={best_val_loss:.6f})")
+                break
+
+        if epoch % 50 == 0:
+            print(f"    epoch {epoch:>4}  val_loss={val_loss:.6f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    return model
+
+
+def apply_feature_selection(X, y=None, method="anova", k=5,
+                             # Autoencoder-specific hyperparameters
+                             ae_epochs=200,
+                             ae_batch_size=32,
+                             ae_lr=1e-3,
+                             ae_patience=20,
+                             ae_hidden_factor=2,
+                             ae_seed=12345):
+    """
+    Applies feature selection and returns a reduced DataFrame.
+
+    Parameters
+    ----------
+    X              : DataFrame — input features (already preprocessed, int-cast)
+    y              : Series    — target labels (required for anova/mutual_info)
+    method         : str
+        'anova'       — ANOVA F-score. Fast, captures only linear feature-target
+                        relationships. Best baseline choice.
+        'mutual_info' — Mutual information. Model-free, captures non-linear
+                        dependencies between features and target.
+        'autoencoder' — Unsupervised deep compression. Trains a symmetric
+                        autoencoder on X and returns the k-dimensional latent
+                        representation. Captures complex non-linear inter-feature
+                        correlations without using y (unsupervised).
+                        Output columns are named ae_0 … ae_{k-1}.
+    k              : int — target number of dimensions / features to keep.
+    ae_epochs      : int — maximum training epochs for the autoencoder.
+    ae_batch_size  : int — mini-batch size for autoencoder training.
+    ae_lr          : float — Adam learning rate.
+    ae_patience    : int — early-stopping patience (epochs without improvement).
+    ae_hidden_factor: int — hidden_dim = ae_hidden_factor × k
+                            (minimum: n_features // 2).
+    ae_seed        : int — random seed for reproducibility.
+
+    Returns
+    -------
+    X_reduced : DataFrame  — shape (n_samples, k)
+    cols      : Index      — column names of the reduced DataFrame
     """
     k = min(k, X.shape[1])
-    if method == "anova":
-        score_func = f_classif
-    elif method == "mutual_info":
-        score_func = mutual_info_classif
-    elif method == "autoencoder":
-        print("[FS] WARNING: autoencoder not implemented — returning X unchanged.")
-        return X, X.columns
-    else:
-        raise ValueError(f"Unknown fs_method '{method}'")
 
-    sel   = SelectKBest(score_func=score_func, k=k)
-    X_arr = sel.fit_transform(X, y)
-    cols  = X.columns[sel.get_support()]
-    print(f"    → kept {k} features: {list(cols)}")
-    return pd.DataFrame(X_arr, columns=cols), cols
+    # ── SelectKBest methods ──────────────────────────────────────────────────
+    if method in ("anova", "mutual_info"):
+        if y is None:
+            raise ValueError(f"method='{method}' requires y (target labels).")
+        score_func = f_classif if method == "anova" else mutual_info_classif
+        sel        = SelectKBest(score_func=score_func, k=k)
+        X_arr      = sel.fit_transform(X, y)
+        cols       = X.columns[sel.get_support()]
+        print(f"    → kept {k} features: {list(cols)}")
+        return pd.DataFrame(X_arr, columns=cols), cols
+
+    # ── Autoencoder ──────────────────────────────────────────────────────────
+    elif method == "autoencoder":
+        n_features  = X.shape[1]
+        hidden_dim  = max(ae_hidden_factor * k, n_features // 2, k + 1)
+
+        print(f"    [AE] architecture: {n_features} → {hidden_dim} → {k} "
+              f"→ {hidden_dim} → {n_features}")
+        print(f"    [AE] epochs={ae_epochs}  batch={ae_batch_size}  "
+              f"lr={ae_lr}  patience={ae_patience}")
+
+        # Normalise: autoencoder training is sensitive to feature scale
+        scaler   = StandardScaler()
+        X_scaled = scaler.fit_transform(X.values.astype(np.float32))
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"    [AE] device: {device}")
+
+        model = _train_autoencoder(
+            X_scaled    = X_scaled,
+            latent_dim  = k,
+            hidden_dim  = hidden_dim,
+            epochs      = ae_epochs,
+            batch_size  = ae_batch_size,
+            lr          = ae_lr,
+            patience    = ae_patience,
+            device      = device,
+            seed        = ae_seed,
+        )
+
+        # Extract latent representations for the full dataset
+        with torch.no_grad():
+            X_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=device)
+            latent   = model.encode(X_tensor).cpu().numpy()
+
+        cols      = pd.Index([f"ae_{i}" for i in range(k)])
+        X_reduced = pd.DataFrame(latent, columns=cols, index=X.index)
+
+        print(f"    [AE] latent shape: {X_reduced.shape}  "
+              f"(columns: {list(cols)})")
+        return X_reduced, cols
+
+    else:
+        raise ValueError(
+            f"fs_method must be 'anova', 'mutual_info' or 'autoencoder'; "
+            f"got '{method}'"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -185,8 +383,20 @@ def createFeatureMap(couples, columns, reps=1):
 #  SPLIT
 # ═══════════════════════════════════════════════════════════════
 
-def splitData(X, y, test_size=0.2):
-    return train_test_split(X, y, test_size=test_size, random_state=12345)
+def splitData(X, y, test_size=0.2, random_state=12345):
+    """
+    Stratified train/test split.
+
+    Parameters
+    ----------
+    random_state : int
+        Controls the shuffling applied before the split.
+        Pass a different integer for each experimental run to produce
+        genuinely independent train/test partitions (repeated random
+        sub-sampling), which is required for statistically valid
+        mean ± std / CI estimates of generalisation performance.
+    """
+    return train_test_split(X, y, test_size=test_size, random_state=random_state)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -441,7 +651,7 @@ def evaluate_qnn_hardware(feature_map, train_features, train_labels,
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CLASSICAL BASELINE
+#  CLASSICAL BASELINES
 # ═══════════════════════════════════════════════════════════════
 
 def evaluate_classical_svm(train_features, train_labels,
@@ -458,3 +668,161 @@ def evaluate_classical_svm(train_features, train_labels,
     metrics = compute_metrics(clf, test_features, test_labels)
     metrics["training_time"] = float(train_t)
     return metrics, clf
+
+
+class _MLPClassifierTorch(nn.Module):
+    """
+    Simple fully-connected MLP for binary / multi-class classification.
+
+    Architecture  (fixed, intentionally shallow to match quantum model scale)
+    ────────────
+    Input → Linear(n_in, 64) → BatchNorm → ReLU → Dropout(0.3)
+          → Linear(64, 32)   → BatchNorm → ReLU → Dropout(0.3)
+          → Linear(32, n_classes)
+
+    Two hidden layers with 64 and 32 units are deliberately comparable in
+    expressivity to the shallow QNN circuits used in SEQUENT, ensuring the
+    comparison is fair and the quantum model is not trivially outperformed by
+    a much deeper classical network.
+    """
+    def __init__(self, n_in: int, n_classes: int,
+                 hidden1: int = 64, hidden2: int = 32, dropout: float = 0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_in, hidden1),
+            nn.BatchNorm1d(hidden1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden2, n_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _SklearnWrapperMLP:
+    """
+    Thin sklearn-compatible wrapper around _MLPClassifierTorch so the MLP
+    can be passed to compute_metrics / compute_metrics_per_class unchanged.
+    """
+    def __init__(self, model, classes, device, scaler):
+        self.model_   = model
+        self.classes_ = classes
+        self._device  = device
+        self._scaler  = scaler
+
+    def predict(self, X):
+        X_s = self._scaler.transform(X)
+        tensor = torch.tensor(X_s, dtype=torch.float32, device=self._device)
+        self.model_.eval()
+        with torch.no_grad():
+            logits = self.model_(tensor)
+            preds  = logits.argmax(dim=1).cpu().numpy()
+        return np.array([self.classes_[p] for p in preds])
+
+
+def evaluate_classical_mlp(train_features, train_labels,
+                            test_features, test_labels,
+                            hidden1=64, hidden2=32, dropout=0.3,
+                            epochs=200, batch_size=32, lr=1e-3,
+                            patience=20, seed=12345):
+    """
+    Classical MLP baseline — direct counterpart of the QNN.
+
+    The architecture (2 hidden layers, 64→32 units) is intentionally kept
+    shallow to match the expressivity of the quantum circuits used in SEQUENT.
+    StandardScaler normalisation is applied internally.
+
+    Parameters
+    ----------
+    train_features, train_labels : array-like — training set.
+    test_features,  test_labels  : array-like — evaluation set.
+    hidden1, hidden2 : int  — units in each hidden layer.
+    dropout          : float — dropout rate applied after each hidden layer.
+    epochs           : int  — maximum training epochs.
+    batch_size       : int  — mini-batch size.
+    lr               : float — Adam learning rate.
+    patience         : int  — early-stopping patience (epochs without improvement
+                               on a 10 % held-out validation split).
+    seed             : int  — controls torch, numpy and dataset shuffle.
+
+    Returns
+    -------
+    metrics : dict  — same keys as compute_metrics + "training_time".
+    model   : _SklearnWrapperMLP  — sklearn-compatible predictor.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    classes = np.unique(train_labels)
+    n_in    = train_features.shape[1]
+    n_cls   = len(classes)
+    label_map = {c: i for i, c in enumerate(classes)}
+
+    # ── Normalise ────────────────────────────────────────────────────────────
+    scaler  = StandardScaler()
+    X_tr_s  = scaler.fit_transform(train_features.astype(np.float32))
+    X_te_s  = scaler.transform(test_features.astype(np.float32))
+
+    # ── Internal val split for early stopping (10 %) ─────────────────────────
+    n_val   = max(1, int(0.1 * len(X_tr_s)))
+    idx     = np.random.permutation(len(X_tr_s))
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    def _to_tensors(X, y_raw):
+        y_mapped = np.array([label_map[c] for c in y_raw], dtype=np.int64)
+        return (torch.tensor(X,        dtype=torch.float32, device=device),
+                torch.tensor(y_mapped, dtype=torch.long,    device=device))
+
+    X_t, y_t   = _to_tensors(X_tr_s[tr_idx],  train_labels[tr_idx])
+    X_v, y_v   = _to_tensors(X_tr_s[val_idx], train_labels[val_idx])
+
+    loader = DataLoader(TensorDataset(X_t, y_t),
+                        batch_size=min(batch_size, len(tr_idx)),
+                        shuffle=True)
+
+    # ── Model, optimiser, loss ────────────────────────────────────────────────
+    model   = _MLPClassifierTorch(n_in, n_cls, hidden1, hidden2, dropout).to(device)
+    opt     = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    loss_fn = nn.CrossEntropyLoss()
+
+    best_val_loss = float("inf")
+    best_state    = None
+    wait          = 0
+
+    t0 = time.time()
+    model.train()
+    for epoch in range(1, epochs + 1):
+        for xb, yb in loader:
+            opt.zero_grad()
+            loss_fn(model(xb), yb).backward()
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = loss_fn(model(X_v), y_v).item()
+        model.train()
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
+            wait          = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+
+    train_t = time.time() - t0
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    wrapper = _SklearnWrapperMLP(model, classes, device, scaler)
+    metrics = compute_metrics(wrapper, test_features, test_labels)
+    metrics["training_time"] = float(train_t)
+    return metrics, wrapper

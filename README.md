@@ -276,7 +276,7 @@ Multi-run experiments (`n_runs > 1`) offset the seed by run index (`12345 + run_
 ```bibtex
 @article{sequent2025,
   title   = {Selective Qubit Entanglement for Efficient Quantum Feature Map Construction},
-  author  = {Rodríguez-Díaz, Francesc and Gutiérrez-Avilés, David and Martínez-Álvarez, Francisco},
+  author  = {F. Rodríguez-Díaz and D. Gutiérrez-Avilés and A. Troncoso and F. Martínez-Álvarez},
   journal = {Quantum Machine Intelligence},
   year    = {2025},
   publisher = {Springer Nature}

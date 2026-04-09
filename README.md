@@ -16,7 +16,7 @@ The pipeline has four stages:
 Raw data
    │
    ▼
-① Classical Feature Selection (ANOVA / Mutual Information)
+① Classical Feature Selection (ANOVA / Autoencoder)
    │   Reduces dimensionality → fewer qubits needed
    ▼
 ② Entanglement Space Construction
@@ -26,6 +26,7 @@ Raw data
 ③ Metaheuristic Search (Simulated Annealing / Genetic Algorithm)
    │   Searches over 2^C(k,2) possible entanglement configurations
    │   Each candidate is evaluated by training a quantum model on a validation split
+   │   GA uses internal k-fold CV to prevent overfitting to small validation sets
    ▼
 ④ Selected Feature Map → Quantum Model Training & Evaluation
       PegasosQSVC (QSVM) or NeuralNetworkClassifier (QNN)
@@ -51,11 +52,11 @@ SEQUENT/
 ├── tools.py              # Data loading, feature maps, models, metrics
 ├── metaheuristicas.py    # Simulated Annealing and Genetic Algorithm
 ├── requirements.txt      # Python dependencies
-├── datasets/             # Local datasets (TSV format)
+├── datasets/             # Local datasets (TSV/CSV format)
 │   ├── breast-w.tsv
-│   ├── fitness_class_2212.tsv
+│   ├── fitness_class_2212.csv
 │   ├── flare.tsv
-│   └── heart.tsv
+│   └── heart.csv
 ├── results/              # Auto-created on first run
 │   ├── benchmark_results.csv   # Aggregated summary (one row per experiment)
 │   └── *.json                  # Full per-run detail (metrics, solution, complexity)
@@ -92,7 +93,7 @@ run_experiment(dataset="corral", option=1, mode="statevector")
 run_experiment(
     dataset="heart",
     option=0,
-    path="./datasets/heart.tsv",
+    path="./datasets/heart.csv",
     use_fs=True,
     fs_method="anova",
     k=5,
@@ -106,7 +107,7 @@ run_experiment(
 
 Results are saved automatically:
 - `results/benchmark_results.csv` — one row per experiment (appended, never overwritten)
-- `results/<run_id>.json` — full log including per-class metrics, circuit complexity and the binary entanglement solution vector
+- `results/<run_id>.json` — full log including per-class metrics, circuit complexity, significance tests and the binary entanglement solution vector
 
 ---
 
@@ -123,43 +124,99 @@ Results are saved automatically:
 | `mode` | `"statevector"` | `"statevector"` · `"noise"` · `"hardware"` |
 | `reps` | `1` | Repetitions of the ZZFeatureMap encoding block |
 | `use_fs` | `True` | Apply feature selection before building the entanglement map |
-| `fs_method` | `"anova"` | `"anova"` · `"mutual_info"` · `"autoencoder"` (placeholder) |
+| `fs_method` | `"anova"` | `"anova"` · `"autoencoder"` |
 | `k` | `5` | Number of features to keep when `use_fs=True` |
 | `metaheuristic` | `"sa"` | `"sa"` (Simulated Annealing) or `"ga"` (Genetic Algorithm) |
-| `n_runs` | `5` | Independent optimisation runs for statistical reporting (mean ± std) |
+| `n_runs` | `5` | Independent runs with different data splits for statistical reporting |
 | `run_baselines` | `True` | Evaluate linear / ring / full entanglement baselines |
 | `run_ablation` | `True` | Run FS-only and entanglement-only ablation variants |
 
-### Speed guide for metaheuristic search
+### SA hyperparameters
 
-Each metaheuristic iteration trains a full quantum model, so the number of evaluations directly controls wall-clock time. The values below give a good accuracy/speed trade-off on datasets with ≤ 200 samples in statevector mode:
-
-| Parameter | Recommended value | Rationale |
+| Parameter | Default | Description |
 |---|---|---|
-| `C` (QSVM) | `1000` | Negligible accuracy loss vs 5000 on small datasets |
-| `num_steps` (Pegasos) | `100` | **5× faster** than 500; accuracy impact < 1% |
-| `sa_initial_temp` | `1.0` | Low T₀ → fast convergence, sufficient for small search spaces |
-| `sa_max_iterations` | `10` | |
-| `sa_num_neighbors` | `3` | 10 × 3 = **~30 evaluations per run** |
-| `ga_population_size` | `10` | |
-| `ga_n_generations` | `5` | **~35–50 unique evaluations** (memoisation eliminates repeats) |
+| `sa_initial_temp` | `10.0` | Starting temperature — set ~10× typical Δcost to allow early exploration |
+| `sa_cooling_rate` | `0.90` | Multiplicative cooling factor per iteration |
+| `sa_stopping_temp` | `0.01` | Algorithm halts when T falls below this value |
+| `sa_max_iterations` | `20` | Maximum number of temperature steps |
+| `sa_num_neighbors` | `5` | Candidates evaluated per temperature step (~100 total evals/run) |
 
-With `mode="statevector"` each evaluation takes ~3–8 s → one SA run ≈ 1.5–4 min.
+### GA hyperparameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ga_population_size` | `20` | Individuals per generation |
+| `ga_n_generations` | `10` | Generations to evolve |
+| `ga_crossover_rate` | `0.8` | Probability of crossover between two parents |
+| `ga_mutation_rate` | `None` | Per-bit flip probability; defaults to `1/chromosome_length` |
+| `ga_tournament_size` | `2` | Selection pressure — lower values preserve more diversity |
+| `ga_elitism_count` | `2` | Top individuals copied unchanged to the next generation |
+| `ga_cv_folds` | `3` | Internal stratified k-fold CV folds used as GA fitness function. Prevents overfitting to a small validation split. Set to `0` to revert to single val split |
+
+---
+
+## Statistical Rigor
+
+Each of the `n_runs` repetitions uses `seed = BASE_SEED + run_idx` for **both** the train/val/test partition and the metaheuristic. This means every run sees a genuinely different data split, making reported mean ± std and 95% CI estimates reflect model uncertainty over unseen data, not just metaheuristic variance. This design is equivalent to repeated random sub-sampling.
+
+### Confidence intervals
+
+All aggregated metrics report a **95% confidence interval** computed using the t-distribution with `n_runs − 1` degrees of freedom:
+
+```
+CI₉₅ = t₀.₉₇₅(n−1) × std / √n
+```
+
+### Significance tests
+
+After all runs complete, three paired one-sided tests (H₁: SEQUENT > baseline) compare SEQUENT against each quantum baseline (linear, ring, full entanglement) evaluated on the **same splits**:
+
+| Test | Type | Notes |
+|---|---|---|
+| **Permutation test** | Non-parametric, exact | Primary test. No minimum sample size. Enumerates all 2ⁿ sign assignments of paired differences |
+| **Sign test** | Non-parametric, exact | Counts wins vs losses; ties dropped. Most conservative |
+| **Paired t-test** | Parametric | Included for reviewer convention; interpret with caution at n < 10 |
+
+The comparison against the classical SVM is also reported for reference, but the **primary statistical claim** is the quantum-to-quantum comparison (SEQUENT vs linear / ring / full entanglement).
+
+When `model_type="qnn"`, an additional paired test compares the QNN against the classical MLP baseline.
+
+Results are printed to console, saved to the JSON log and appended to the CSV with columns `linear_perm_p`, `ring_perm_p`, `full_perm_p`, etc.
+
+---
+
+## Experiment Grid
+
+The full factorial experiment covers all combinations of:
+
+| Axis | Values |
+|---|---|
+| Model | `qsvm`, `qnn` |
+| Metaheuristic | `sa`, `ga` |
+| Feature selection | `anova`, `autoencoder` |
+| Reps | `1`, `3`, `5` |
+| n\_runs | `5` (fixed) |
+| k | `5` (fixed) |
+
+This produces **24 configurations × 5 datasets = 120 experiments**.
+
+Baselines (linear / ring / full entanglement) are evaluated only at `reps=1`, since their circuits are independent of reps. The ablation study (FS-only, entanglement-only) is only run for the canonical configuration (`reps=1`, `anova`, `sa`) to avoid redundant computational expense.
 
 ---
 
 ## Datasets
 
-Four real-world binary classification datasets are included in `datasets/`. All are in TSV format with a `target` column.
+| Dataset | Samples | Features | Class balance | Source |
+|---|---|---|---|---|
+| Corral | 160 | 6 | 56% / 44% | PMLB |
+| BreastW | 699 | 9 | 63% benign / 37% malignant | Local TSV |
+| Fitness | 1500 | 6 | 70% class 1 / 30% class 0 | Local CSV |
+| Flare | ~1066 | **11** | varies | Local TSV |
+| Heart | 918 | varies | 44% normal / 56% disease | Local CSV |
 
-| Dataset | Samples | Features (after preprocessing) | Class balance |
-|---|---|---|---|
-| BreastW | 699 | 9 | 63% benign / 37% malignant |
-| Fitness | 1500 | 6 | 70% class 1 / 30% class 0 |
-| Flare | ~1000 | 10–11 | varies |
-| Heart | 918 | varies | 44% normal / 56% disease |
+> **Note on Flare**: the deprecated version of the dataset is used, which contains **11 features**. Some mirrors of the dataset report 10 features; the version used here is the original with the additional attribute included.
 
-The `corral` dataset is loaded directly from PMLB (`option=1`, no local file needed).
+Three datasets (BreastW, Fitness, Heart) are class-imbalanced. For these, accuracy alone is insufficient — the paper reports and analyses macro-averaged precision, recall and F1, as well as per-class breakdowns.
 
 ---
 
@@ -167,11 +224,11 @@ The `corral` dataset is loaded directly from PMLB (`option=1`, no local file nee
 
 ### PegasosQSVC (QSVM)
 
-The default model. Uses a `FidelityQuantumKernel` built on the SEQUENT feature map, optimised with the Pegasos SGD-SVM algorithm. Fast enough for metaheuristic search at `num_steps=100`.
+The default model. Uses a `FidelityQuantumKernel` built on the SEQUENT feature map, optimised with the Pegasos SGD-SVM algorithm (`C=1000`, `num_steps=100`).
 
 ### NeuralNetworkClassifier (QNN)
 
-A parameterised quantum circuit composed of the SEQUENT feature map followed by a `TwoLocal` ansatz (Ry + Rz rotations, CX linear entanglement). Trained with COBYLA. Three execution variants:
+A parameterised quantum circuit composed of the SEQUENT feature map followed by a `TwoLocal` ansatz (Ry + Rz rotations, CX linear entanglement). Trained with COBYLA (maxiter=100).
 
 | Mode | Backend | Notes |
 |---|---|---|
@@ -179,32 +236,35 @@ A parameterised quantum circuit composed of the SEQUENT feature map followed by 
 | `noise` | `AerSimulator` + IBM noise model | GPU-accelerated via tensor network method |
 | `hardware` | Real IBM Quantum device | ALAP scheduling + XX dynamical decoupling |
 
+### Classical MLP baseline (QNN track only)
+
+When `model_type="qnn"`, a shallow classical MLP is evaluated on every split alongside the QNN. The architecture (Linear → 64 → 32 → n\_classes, BatchNorm + ReLU + Dropout) is deliberately comparable in depth to the quantum circuits, ensuring a fair classical-vs-quantum comparison. Training uses Adam with early stopping on a 10% held-out split. A paired significance test (SEQUENT QNN vs MLP) is computed and saved alongside the quantum baseline comparisons.
+
 ---
 
 ## Metaheuristics
 
 Both optimisers share the same interface and are fully interchangeable.
 
-### Simulated Annealing (`metaheuristicas.py`)
+### Simulated Annealing
 
-At each temperature step, `num_neighbors` candidates are generated by flipping a random bit in the current solution. A worse candidate is accepted with probability exp(−Δcost / T), allowing escape from local optima early in the search.
+At each temperature step, `num_neighbors` candidates are generated by flipping a random bit in the current solution. A worse candidate is accepted with probability exp(−Δcost / T), allowing escape from local optima early in the search. The initial temperature `sa_initial_temp=10.0` is set approximately 10× the typical accuracy difference between neighbouring solutions, ensuring genuine thermal exploration before cooling constrains the search.
 
-### Genetic Algorithm (`metaheuristicas.py`)
+### Genetic Algorithm
 
 A steady-state GA with:
-- **Tournament selection** (pressure controlled by `tournament_size`)
-- **Uniform crossover** — each bit independently chosen from either parent with p = 0.5, preserving useful patterns regardless of position
-- **Bit-flip mutation** with default rate 1/chromosome_length (canonical for binary encoding)
-- **Elitism** — top `elitism_count` individuals always survive
+- **Tournament selection** with `tournament_size=2` — lower pressure than the canonical value of 3, preserving diversity in small populations
+- **Uniform crossover** — each bit independently chosen from either parent with p = 0.5
+- **Bit-flip mutation** with default rate `1/chromosome_length`
+- **Elitism** — top `elitism_count=2` individuals always survive
+- **Internal k-fold CV** (`ga_cv_folds=3`) — fitness is the mean accuracy over stratified 3-fold CV on the combined train+val set. This prevents the GA from converging to entanglement maps that overfit a small validation partition, a failure mode that does not affect SA due to its natural thermal exploration
 - **Memoisation** — quantum evaluations already computed are never repeated
-
-Both optimisers minimise cost = −accuracy, so maximising accuracy is equivalent.
 
 ---
 
 ## Metrics and Output
 
-Every experiment reports the following metrics, computed on the test set:
+Every experiment reports the following metrics on the test set:
 
 | Metric | Why it matters |
 |---|---|
@@ -220,7 +280,7 @@ Every experiment reports the following metrics, computed on the test set:
 | Two-qubit gates | Primary source of noise in NISQ devices |
 | Search space size | 2^C(k,2) — scalability analysis |
 
-Macro averaging is used throughout because three of the five datasets are class-imbalanced (BreastW, Fitness, Heart). Per-class metrics are logged both to JSON and printed to console.
+Macro averaging is used throughout because three of the five datasets are class-imbalanced. Per-class metrics are logged to JSON, printed to console and averaged with ± std and 95% CI across runs.
 
 ### Console output example
 
@@ -229,18 +289,23 @@ Macro averaging is used throughout because three of the five datasets are class-
 ║  SEQUENT  |  heart  |  QSVM  |  statevector  |  SA  |  FS:True     ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-┌── Baseline: Classical RBF-SVM  (raw features, test set) ───────────┐
-│  SVM test               Acc:0.8478       Prec:0.8401  Rec:0.8502  F1:0.8449
-└────────────────────────────────────────────────────────────────────┘
+┌── Baseline: Linear Entanglement  (5 runs, raw features, mean ± std [95% CI]) ┐
+│  test (aggregated)  Acc:0.8312 ±0.0201 [95%CI ±0.0250] ...
+└──────────────────────────────────────────────────────────────────────────────┘
 
-┌── SEQUENT  —  Aggregated (5 runs, mean ± std) ─────────────────────┐
-│  validation             Acc:0.8750 ±0.0120  Prec:0.8701  Rec:0.8790  F1:0.8745 ±0.0115
-│  test                   Acc:0.8804 ±0.0098  Prec:0.8756  Rec:0.8841  F1:0.8798 ±0.0102
-│  Per-class test metrics (mean over 5 runs):
-│    class 0       f1:0.8611 ±0.0143
-│    class 1       f1:0.8985 ±0.0071
-│  complexity             depth:24  total_gates:67  2Q-gates:8  search_space:1024
-└────────────────────────────────────────────────────────────────────┘
+┌── SEQUENT  —  Aggregated (5 runs, mean ± std [95% CI]) ──────────────────────┐
+│  test               Acc:0.8804 ±0.0098 [95%CI ±0.0122]  F1:0.8798 ±0.0102
+│  Per-class test metrics (mean ± std over 5 runs):
+│    class 0     f1:0.8611 ±0.0143 [95%CI ±0.0178]
+│    class 1     f1:0.8985 ±0.0071 [95%CI ±0.0088]
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌── Statistical Significance  (SEQUENT vs Linear entanglement) ────────────────┐
+│  n_runs = 5  (one-sided tests, H1: SEQUENT > baseline)
+│  Permutation test  (primary):    p = 0.0312  *** p<0.05
+│  Sign test         (robust):     p = 0.0625  not significant  (wins=4, ties=0)
+│  Paired t-test     (parametric): p = 0.0289  *** p<0.05
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -255,23 +320,27 @@ Setting `run_ablation=True` runs two additional variants that isolate the contri
 | **Entanglement-only** | ✗ | ✓ (raw features) | How much does entanglement search alone explain? |
 | **SEQUENT** | ✓ | ✓ | Full methodology |
 
+Ablation is run only for the canonical configuration (`reps=1`, `anova`, `sa`) on split-0, since its purpose is qualitative component analysis rather than statistical estimation.
+
 ---
 
 ## Reproducibility
 
-All experiments use fixed seeds:
+All experiments use a fixed base seed:
 
 ```python
-random.seed(12345)
-np.random.seed(12345)
-algorithm_globals.random_seed = 12345
+BASE_SEED = 12345
+random.seed(BASE_SEED)
+np.random.seed(BASE_SEED)
+algorithm_globals.random_seed = BASE_SEED
 ```
 
-Multi-run experiments (`n_runs > 1`) offset the seed by run index (`12345 + run_idx`) to ensure each run is independent while remaining fully reproducible.
+Multi-run experiments offset the seed by run index (`BASE_SEED + run_idx`) for **both** the data partition and the metaheuristic, ensuring each run is independent while remaining fully reproducible. The complete list of split seeds used is saved to the JSON log under `split_seeds`.
 
 ---
 
 ## Citation
+
 <!--
 ```bibtex
 @article{sequent2025,

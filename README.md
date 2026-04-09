@@ -272,7 +272,7 @@ Multi-run experiments (`n_runs > 1`) offset the seed by run index (`12345 + run_
 ---
 
 ## Citation
-
+<!--
 ```bibtex
 @article{sequent2025,
   title   = {Selective Qubit Entanglement for Efficient Quantum Feature Map Construction},
@@ -282,6 +282,7 @@ Multi-run experiments (`n_runs > 1`) offset the seed by run index (`12345 + run_
   publisher = {Springer Nature}
 }
 ```
+-->
 
 ---
 

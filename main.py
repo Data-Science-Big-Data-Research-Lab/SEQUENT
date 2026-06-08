@@ -1,24 +1,70 @@
+"""
+main.py — SEQUENT Experiment Runner
+====================================
+Runs the SEQUENT feature-map search experiment for one or more dataset/model
+configurations, fully sequentially (no multiprocessing, no thread fans).
+
+Configuration is at the bottom under "EXPERIMENT GRID". Adjust datasets,
+models, metaheuristics, feature-selection methods, and execution mode there.
+
+Execution mode:
+  "statevector"  — ideal AerSimulator, fast, for local testing
+  "noise"        — noise-model AerSimulator (requires IBM account)
+  "hardware"     — real IBM Quantum backend (requires IBM account + credits)
+
+IBM credentials:
+  Set IBM_QUANTUM_TOKEN and IBM_QUANTUM_INSTANCE as environment variables,
+  or hard-code them in the CREDENTIALS section below.
+"""
+
 import os
-import time
+import datetime
 import json
 import random
-import datetime
+from collections import Counter
+from contextlib import nullcontext
+
 import numpy as np
 import pandas as pd
 import scipy.stats as sp_stats
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split
 from qiskit_algorithms.utils import algorithm_globals
+from qiskit_ibm_runtime import QiskitRuntimeService, Session
 
 import tools as t
-from metaheuristicas import simulated_annealing, genetic_algorithm
+from metaheuristicas import (
+    simulated_annealing,
+    tabu_search,
+    iterated_local_search,
+    genetic_algorithm,
+)
 
-# ─── Base seed (partitions are BASE_SEED + run_idx) ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CREDENTIALS  (prefer environment variables over hard-coding)
+# ─────────────────────────────────────────────────────────────────────────────
+_IBM_TOKEN    = os.environ.get("IBM_QUANTUM_TOKEN", "")
+_IBM_INSTANCE = os.environ.get("IBM_QUANTUM_INSTANCE", "")
+
+if _IBM_TOKEN:
+    QiskitRuntimeService.save_account(
+        channel="ibm_quantum_platform",
+        token=_IBM_TOKEN,
+        instance=_IBM_INSTANCE,
+        overwrite=True,
+        set_as_default=True,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL SEED
+# ─────────────────────────────────────────────────────────────────────────────
 BASE_SEED = 12345
 random.seed(BASE_SEED)
 np.random.seed(BASE_SEED)
 algorithm_globals.random_seed = BASE_SEED
 
-# ─── Model/mode dispatch ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPATCH TABLES
+# ─────────────────────────────────────────────────────────────────────────────
 _EVALUATE = {
     "qsvm": {
         "statevector": t.evaluate_qsvm_statevector,
@@ -33,986 +79,758 @@ _EVALUATE = {
 }
 
 _OPTIMISER = {
-    "sa": simulated_annealing,
-    "ga": genetic_algorithm,
+    "sa":  simulated_annealing,
+    "ts":  tabu_search,
+    "ils": iterated_local_search,
+    "ga":  genetic_algorithm,
+}
+
+_FM_FACTORY = {
+    "linear": t.createFeatureMapLinear,
+    "ring":   t.createFeatureMapRing,
+    "full":   t.createFeatureMapFull,
 }
 
 os.makedirs("results", exist_ok=True)
 _CSV_PATH = os.path.join("results", "benchmark_results.csv")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  OUTPUT HELPERS
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# PRINT HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _header(text, width=70):
-    bar = "═" * width
-    print(f"\n╔{bar}╗")
-    lines = [text[i:i+width] for i in range(0, len(text), width)]
-    for line in lines:
-        print(f"║  {line:<{width-2}}║")
-    print(f"╚{bar}╝")
+    bar = "=" * width
+    print(f"\n+{bar}+")
+    for chunk in [text[i:i + width] for i in range(0, len(text), width)]:
+        print(f"|  {chunk:<{width - 2}}|")
+    print(f"+{bar}+")
+
 
 def _section(title):
-    print(f"\n┌── {title} {'─'*max(0, 65-len(title))}┐")
+    print(f"\n--- {title} {'-' * max(0, 65 - len(title))}")
+
 
 def _section_end():
-    print(f"└{'─'*69}┘")
+    print("-" * 72)
+
 
 def _row(label, metrics):
-    """Print a single labelled metrics row inside a section."""
-    acc  = metrics.get("accuracy",        metrics.get("accuracy_mean",        0))
-    prec = metrics.get("precision_macro", metrics.get("precision_macro_mean",  0))
-    rec  = metrics.get("recall_macro",    metrics.get("recall_macro_mean",     0))
-    f1   = metrics.get("f1_macro",        metrics.get("f1_macro_mean",         0))
-    ttime = metrics.get("training_time",  metrics.get("training_time_mean",    0))
-    itime = metrics.get("inference_time", metrics.get("inference_time_mean",   0))
-
-    std_acc = metrics.get("accuracy_std", None)
-    std_f1  = metrics.get("f1_macro_std", None)
-    ci_acc  = metrics.get("accuracy_ci95", None)
-    ci_f1   = metrics.get("f1_macro_ci95", None)
+    acc  = metrics.get("accuracy", metrics.get("accuracy_mean", 0))
+    prec = metrics.get("precision_macro", metrics.get("precision_macro_mean", 0))
+    rec  = metrics.get("recall_macro", metrics.get("recall_macro_mean", 0))
+    f1   = metrics.get("f1_macro", metrics.get("f1_macro_mean", 0))
+    tt   = metrics.get("training_time", metrics.get("training_time_mean", 0))
+    it   = metrics.get("inference_time", metrics.get("inference_time_mean", 0))
 
     acc_str = f"{acc:.4f}"
-    if std_acc is not None:
-        acc_str += f" ±{std_acc:.4f}"
-    if ci_acc is not None:
-        acc_str += f" [95%CI ±{ci_acc:.4f}]"
+    if (s := metrics.get("accuracy_std")) is not None:
+        acc_str += f" +/-{s:.4f}"
+    if (c := metrics.get("accuracy_ci95")) is not None:
+        acc_str += f" [95%CI +/-{c:.4f}]"
 
     f1_str = f"{f1:.4f}"
-    if std_f1 is not None:
-        f1_str += f" ±{std_f1:.4f}"
-    if ci_f1 is not None:
-        f1_str += f" [95%CI ±{ci_f1:.4f}]"
+    if (s := metrics.get("f1_macro_std")) is not None:
+        f1_str += f" +/-{s:.4f}"
 
-    print(f"│  {label:<22} Acc:{acc_str:<30} Prec:{prec:.4f}  Rec:{rec:.4f}  F1:{f1_str}")
-    if ttime > 0:
-        inf_str = f"{itime:.3f}s" if itime > 0 else "—"
-        print(f"│  {'':22} Train:{ttime:.2f}s  Infer:{inf_str}")
+    print(f"|  {label:<22} Acc:{acc_str:<30} Prec:{prec:.4f}  Rec:{rec:.4f}  F1:{f1_str}")
+    if tt > 0:
+        print(f"|  {'':22} Train:{tt:.2f}s  Infer:{f'{it:.3f}s' if it > 0 else '-'}")
+
 
 def _circuit_row(label, complexity):
-    d   = complexity.get("depth", complexity.get("depth_mean", 0))
-    tg  = complexity.get("total_gates", complexity.get("total_gates_mean", 0))
-    tq  = complexity.get("two_qubit_gates", complexity.get("two_qubit_gates_mean", 0))
-    ss  = complexity.get("search_space", "—")
-    print(f"│  {label:<22} depth:{d}  total_gates:{tg}  2Q-gates:{tq}  search_space:{ss}")
+    print(
+        f"|  {label:<22} depth:{complexity.get('depth', 0)}  "
+        f"total_gates:{complexity.get('total_gates', 0)}  "
+        f"2Q-gates:{complexity.get('two_qubit_gates', 0)}  "
+        f"search_space:{complexity.get('search_space', '-')}"
+    )
+
 
 def _class_rows(per_class):
     for cls, m in per_class.items():
-        print(f"│    class {cls:<6}  prec:{m['precision']:.4f}  "
-              f"rec:{m['recall']:.4f}  f1:{m['f1']:.4f}  n={m['support']}")
+        print(f"|    class {cls:<6}  prec:{m['precision']:.4f}  rec:{m['recall']:.4f}  "
+              f"f1:{m['f1']:.4f}  n={m['support']}")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  STATS HELPERS
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# STATISTICS HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _aggregate(results_list):
-    """
-    Mean ± std ± 95 % CI for every numeric key across multiple runs.
-
-    The 95 % CI uses the t-distribution with (n-1) degrees of freedom,
-    which is appropriate for small samples (n_runs typically 5–10).
-    """
     if not results_list:
         return {}
-    keys = results_list[0].keys()
-    out  = {}
-    for k in keys:
+    out = {}
+    for k in results_list[0]:
         vals = [r[k] for r in results_list
-                if isinstance(r[k], (int, float)) and not np.isnan(r[k])]
+                if isinstance(r.get(k), (int, float)) and not np.isnan(r[k])]
         if vals:
-            n   = len(vals)
-            mu  = float(np.mean(vals))
-            std = float(np.std(vals, ddof=1))   # sample std (ddof=1)
+            n = len(vals)
+            mu = float(np.mean(vals))
+            std = float(np.std(vals, ddof=1)) if n > 1 else 0.0
             sem = std / np.sqrt(n)
-            # t critical value at 97.5th percentile, df = n-1
-            t_crit = float(sp_stats.t.ppf(0.975, df=max(n - 1, 1)))
-            ci95   = float(t_crit * sem)
+            ci95 = float(sp_stats.t.ppf(0.975, df=max(n - 1, 1))) * sem
             out[f"{k}_mean"] = mu
             out[f"{k}_std"]  = std
             out[f"{k}_ci95"] = ci95
     return out
 
 
-def _significance_tests(sequent_accs, baseline_accs):
-    """
-    Paired statistical tests comparing SEQUENT vs a baseline across n_runs.
-
-    Test battery (all one-sided, H1: SEQUENT > baseline):
-    ─────────────────────────────────────────────────────
-    1. Permutation test (primary)
-       Exact, non-parametric, no minimum sample size. Works by enumerating
-       all 2^n sign assignments of the paired differences and computing the
-       fraction that are >= the observed sum. This is the recommended test
-       for small-n comparisons in ML (Demšar, JMLR 2006).
-
-    2. Sign test (fallback / complementary)
-       Counts how many runs SEQUENT wins. Exact binomial p-value under H0
-       that each run is a coin flip. Robust to ties (tied runs are dropped).
-       Very conservative but valid at any n.
-
-    3. Paired t-test (reported for completeness / journal convention)
-       Parametric; normality assumption is unlikely to hold for n<10, so
-       use with caution. Included because many reviewers expect to see it.
-
-    Parameters
-    ----------
-    sequent_accs   : list[float]  — SEQUENT test accuracy per run.
-    baseline_accs  : list[float]  — Baseline test accuracy on the same splits.
-
-    Returns
-    -------
-    dict with all test statistics and boolean significance flags.
-    """
-    n = len(sequent_accs)
-    results = {"n_runs": n}
-
+def _significance_tests(a_list, b_list):
+    """One-sided Wilcoxon signed-rank test: H1 = SEQUENT (a) > baseline (b)."""
+    n = len(a_list)
+    res = {"n_runs": n}
     if n < 2:
-        results["note"] = "Need n_runs >= 2 for significance tests"
-        return results
+        res["note"] = "Need n_runs >= 2"
+        return res
 
-    a = np.array(sequent_accs,  dtype=float)
-    b = np.array(baseline_accs, dtype=float)
+    a = np.array(a_list, dtype=float)
+    b = np.array(b_list, dtype=float)
     diffs = a - b
 
-    # ── 1. Permutation test (exact, one-sided) ────────────────────────────
+    # Wilcoxon signed-rank test (one-sided: H1 = a > b)
     try:
-        observed_stat = float(np.sum(diffs))
-        # Enumerate all 2^n sign flips
-        count_ge = 0
-        total    = 0
-        for signs in range(1 << n):
-            sign_vec = np.array(
-                [1 if (signs >> i) & 1 else -1 for i in range(n)],
-                dtype=float)
-            perm_stat = float(np.sum(np.abs(diffs) * sign_vec))
-            if perm_stat >= observed_stat:
-                count_ge += 1
-            total += 1
-        p_perm = count_ge / total
-        results["permutation_stat"]   = observed_stat
-        results["permutation_p"]      = float(p_perm)
-        results["permutation_sig_05"] = bool(p_perm < 0.05)
-    except Exception as e:
-        results["permutation_error"] = str(e)
-
-    # ── 2. Sign test (exact binomial, one-sided) ──────────────────────────
-    try:
-        wins   = int(np.sum(diffs > 0))
+        wins = int(np.sum(diffs > 0))
         losses = int(np.sum(diffs < 0))
-        n_tied = int(np.sum(diffs == 0))
-        n_eff  = wins + losses          # drop ties
-        if n_eff > 0:
-            # P(X >= wins) under Binomial(n_eff, 0.5)
-            p_sign = float(sp_stats.binom_test(wins, n_eff, 0.5,
-                                               alternative="greater"))
-        else:
-            p_sign = 1.0                # all ties → no evidence
-        results["sign_wins"]    = wins
-        results["sign_losses"]  = losses
-        results["sign_ties"]    = n_tied
-        results["sign_p"]       = p_sign
-        results["sign_sig_05"]  = bool(p_sign < 0.05)
+        ties = int(np.sum(diffs == 0))
+        stat_w, p_w_two = sp_stats.wilcoxon(a, b, alternative="two-sided")
+        # Convert two-sided p to one-sided (greater)
+        p_w = float(p_w_two / 2) if np.sum(diffs) > 0 else 1.0
+        res.update(
+            wilcoxon_stat=float(stat_w),
+            wilcoxon_p=p_w,
+            wilcoxon_sig_05=p_w < 0.05,
+            wilcoxon_wins=wins,
+            wilcoxon_losses=losses,
+            wilcoxon_ties=ties,
+        )
     except Exception as e:
-        # binom_test deprecated in scipy >=1.11 → use binomtest
-        try:
-            bt = sp_stats.binomtest(wins, n_eff, 0.5, alternative="greater")
-            p_sign = float(bt.pvalue)
-            results["sign_wins"]    = wins
-            results["sign_losses"]  = losses
-            results["sign_ties"]    = n_tied
-            results["sign_p"]       = p_sign
-            results["sign_sig_05"]  = bool(p_sign < 0.05)
-        except Exception as e2:
-            results["sign_error"] = str(e2)
+        res["wilcoxon_error"] = str(e)
 
-    # ── 3. Paired t-test (parametric, for completeness) ───────────────────
-    try:
-        stat_t, p_t_two = sp_stats.ttest_rel(a, b)
-        p_t = float(p_t_two / 2) if stat_t > 0 else 1.0   # one-sided
-        results["ttest_stat"]    = float(stat_t)
-        results["ttest_p"]       = p_t
-        results["ttest_sig_05"]  = bool(p_t < 0.05)
-    except Exception as e:
-        results["ttest_error"] = str(e)
-
-    return results
+    return res
 
 
-def _print_significance_block(sig_dict, label):
-    _section(f"Statistical Significance  ({label})")
-    n = sig_dict.get("n_runs", 0)
-    if "note" in sig_dict:
-        print(f"│  {sig_dict['note']}")
+def _print_significance(sig, label):
+    _section(f"Statistical Significance ({label})")
+    if "note" in sig:
+        print(f"|  {sig['note']}")
         _section_end()
         return
-
-    print(f"│  n_runs = {n}  (one-sided tests, H1: SEQUENT > baseline)")
-
-    # Permutation test
-    if "permutation_p" in sig_dict:
-        p   = sig_dict["permutation_p"]
-        sig = sig_dict["permutation_sig_05"]
-        print(f"│  Permutation test  (primary):    "
-              f"p = {p:.4f}  {'*** p<0.05' if sig else 'not significant'}")
-
-    # Sign test
-    if "sign_p" in sig_dict:
-        p    = sig_dict["sign_p"]
-        sig  = sig_dict["sign_sig_05"]
-        wins = sig_dict.get("sign_wins", "?")
-        ties = sig_dict.get("sign_ties", 0)
-        print(f"│  Sign test         (robust):     "
-              f"p = {p:.4f}  {'*** p<0.05' if sig else 'not significant'}"
-              f"  (wins={wins}, ties={ties})")
-
-    # t-test
-    if "ttest_p" in sig_dict:
-        p   = sig_dict["ttest_p"]
-        sig = sig_dict["ttest_sig_05"]
-        print(f"│  Paired t-test     (parametric): "
-              f"p = {p:.4f}  {'*** p<0.05' if sig else 'not significant'}")
-
+    print(f"|  n={sig['n_runs']}  (one-sided Wilcoxon, H1: SEQUENT > baseline)")
+    if "wilcoxon_p" in sig:
+        print(f"|  Wilcoxon:    W={sig['wilcoxon_stat']:.4f}  p={sig['wilcoxon_p']:.4f}  "
+              f"{'*** p<0.05' if sig['wilcoxon_sig_05'] else 'n.s.'}  "
+              f"(wins={sig.get('wilcoxon_wins', '?')}, losses={sig.get('wilcoxon_losses', '?')}, "
+              f"ties={sig.get('wilcoxon_ties', 0)})")
+    if "wilcoxon_error" in sig:
+        print(f"|  Wilcoxon error: {sig['wilcoxon_error']}")
     _section_end()
 
 
-# ═══════════════════════════════════════════════════════════════
-#  OBJECTIVE FUNCTION FACTORY
-# ═══════════════════════════════════════════════════════════════
+def _directional_comparison(a_list, b_list):
+    if not a_list or not b_list:
+        return {}
+    a, b = np.array(a_list, dtype=float), np.array(b_list, dtype=float)
+    diffs = a - b
+    return {
+        "wins": int(np.sum(diffs > 0)),
+        "losses": int(np.sum(diffs < 0)),
+        "ties": int(np.sum(diffs == 0)),
+        "mean_diff": float(np.mean(diffs)),
+        "sequent_acc_mean": float(np.mean(a)),
+        "baseline_acc_mean": float(np.mean(b)),
+    }
 
-def _build_objective(couples_array, columns, tr, y_tr, val, y_val,
-                     evaluate_fn, reps, cache, cv_folds=0):
-    """
-    Returns a memoised f(vector) -> (cost, training_time).
-    cost = -accuracy so optimisers that minimise cost maximise accuracy.
 
-    Parameters
-    ----------
-    cv_folds : int
-        0  → use the single (tr, val) split as before.  Fast; used for SA.
-        >0 → use stratified k-fold CV on tr+val combined.  Slower (k× evals
-             per solution) but prevents overfitting to a small val split.
-             Recommended for the GA, which has high selection pressure and
-             converges quickly to solutions that overfit a single val set.
-    """
-    def objective(vector):
+def _build_warm_start(scores, activation_ratio=0.30):
+    if scores is None:
+        return None
+    arr = np.nan_to_num(np.abs(np.asarray(scores, dtype=float)),
+                        nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    if arr.size == 0 or np.all(np.isneginf(arr)):
+        warm = [0] * len(arr)
+        if warm:
+            warm[0] = 1
+        return warm
+    n_active = max(1, min(len(arr), int(round(len(arr) * activation_ratio))))
+    warm = [0] * len(arr)
+    for idx in np.argsort(arr)[::-1][:n_active]:
+        warm[int(idx)] = 1
+    return warm
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OBJECTIVE FUNCTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _Objective:
+    """Callable objective: evaluates a binary entanglement mask on val set."""
+
+    MIN_ACTIVE = 3
+    MAX_ACTIVE = 5
+    PENALTY_STEP = 0.01
+
+    def __init__(self, couples_array, columns, tr, y_tr, val, y_val,
+                 evaluate_fn, reps, cache, objective_metric="accuracy"):
+        self.couples_array = couples_array
+        self.columns = columns
+        self.tr, self.y_tr = tr, y_tr
+        self.val, self.y_val = val, y_val
+        self.evaluate_fn = evaluate_fn
+        self.reps = reps
+        self.cache = cache
+        self.objective_metric = objective_metric
+
+    def _penalty(self, vector):
+        n = int(np.sum(vector))
+        if n < self.MIN_ACTIVE:
+            return self.PENALTY_STEP * (self.MIN_ACTIVE - n)
+        if n > self.MAX_ACTIVE:
+            return self.PENALTY_STEP * (n - self.MAX_ACTIVE)
+        return 0.0
+
+    def __call__(self, vector):
         key = str(vector)
-        if key in cache:
-            return cache[key]["cost"], cache[key]["aux"]
+        if key in self.cache:
+            return self.cache[key]["cost"], self.cache[key]["aux"]
 
-        selected = [couples_array[i] for i, b in enumerate(vector) if b == 1]
-        fm       = t.createFeatureMap(selected, columns, reps=reps)
+        selected = [self.couples_array[i] for i, bit in enumerate(vector) if bit == 1]
+        fm = t.createFeatureMap(selected, self.columns, reps=self.reps)
+        metrics, model = self.evaluate_fn(fm, self.tr, self.y_tr, self.val, self.y_val)
 
-        if cv_folds < 2:
-            # ── Original behaviour: single val split ──────────────────────
-            metrics, model = evaluate_fn(fm, tr, y_tr, val, y_val)
-            cost = -metrics["accuracy"]
-            cache[key] = {
-                "solution":    vector[:],
-                "cost":        cost,
-                "aux":         metrics["training_time"],
-                "metrics":     metrics,
-                "model":       model,
-                "feature_map": fm,
-            }
-        else:
-            # ── k-fold CV on train+val combined ───────────────────────────
-            # Merge tr and val so the CV uses all available labelled data.
-            X_all = np.vstack([tr, val])
-            y_all = np.concatenate([y_tr, y_val])
-            skf   = StratifiedKFold(n_splits=cv_folds, shuffle=True,
-                                    random_state=42)
-            fold_accs  = []
-            fold_precs = []
-            fold_recs  = []
-            fold_f1s   = []
-            last_model = None
-            t_start = time.time()
-            for fold_tr_idx, fold_val_idx in skf.split(X_all, y_all):
-                fold_m, fold_model = evaluate_fn(
-                    fm,
-                    X_all[fold_tr_idx], y_all[fold_tr_idx],
-                    X_all[fold_val_idx], y_all[fold_val_idx],
-                )
-                fold_accs.append(fold_m["accuracy"])
-                fold_precs.append(fold_m.get("precision_macro", float("nan")))
-                fold_recs.append(fold_m.get("recall_macro",    float("nan")))
-                fold_f1s.append(fold_m.get("f1_macro",         float("nan")))
-                last_model = fold_model
-            cv_acc  = float(np.mean(fold_accs))
-            cv_std  = float(np.std(fold_accs))
-            elapsed = time.time() - t_start
-            cost    = -cv_acc
-            # Synthetic metrics dict averaging all folds — keeps the rest of
-            # the pipeline (display, aggregation) working unchanged.
-            metrics = {
-                "accuracy":        cv_acc,
-                "accuracy_std_cv": cv_std,
-                "precision_macro": float(np.nanmean(fold_precs)),
-                "recall_macro":    float(np.nanmean(fold_recs)),
-                "f1_macro":        float(np.nanmean(fold_f1s)),
-                "inference_time":  0.0,
-                "training_time":   elapsed,
-            }
-            cache[key] = {
-                "solution":    vector[:],
-                "cost":        cost,
-                "aux":         elapsed,
-                "metrics":     metrics,
-                "model":       last_model,
-                "feature_map": fm,
-            }
+        val_metric = metrics.get(self.objective_metric, metrics["accuracy"])
+        penalty = self._penalty(vector)
+        cost = -(val_metric - penalty)
 
-        return cache[key]["cost"], cache[key]["aux"]
-    return objective
+        self.cache[key] = {
+            "solution": list(vector), "cost": float(cost),
+            "aux": metrics.get("training_time", 0.0),
+            "metrics": metrics, "model": model, "feature_map": fm,
+            "active_pairs": int(np.sum(vector)), "mask_penalty": float(penalty),
+        }
+        return cost, self.cache[key]["aux"]
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SAVING HELPERS
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# DATA SPLIT & FEATURE-SELECTION HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _make_splits(X, y, seed):
+    X_outer, X_test, y_outer, y_test = t.splitData(X, y, test_size=0.3, random_state=seed)
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_outer, y_outer, test_size=0.3, random_state=seed, stratify=y_outer)
+    return dict(outer_train_X=X_outer, outer_train_y=y_outer,
+                search_train_X=X_tr, search_train_y=y_tr,
+                search_val_X=X_val, search_val_y=y_val,
+                test_X=X_test, test_y=y_test)
+
+
+def _prepare_fs_views(splits, use_fs, fs_method, k, seed):
+    X_str, y_str = splits["search_train_X"], splits["search_train_y"]
+
+    if use_fs:
+        _, X_str_fs, others = t.fit_transform_feature_selection(
+            X_str,
+            [splits["search_val_X"], splits["outer_train_X"], splits["test_X"]],
+            y_train=y_str, method=fs_method, k=k, ae_seed=seed,
+        )
+        X_val_fs, X_outer_fs, X_test_fs = others
+    else:
+        X_str_fs = X_str.copy()
+        X_val_fs = splits["search_val_X"].copy()
+        X_outer_fs = splits["outer_train_X"].copy()
+        X_test_fs = splits["test_X"].copy()
+
+    fs_cols = X_str_fs.columns
+    fs_scores = t.transformCorrelations(X_str_fs.corr())
+    pairs_fs = t.createCouples(fs_scores, fs_cols)
+    warm_start = _build_warm_start(fs_scores)
+
+    return dict(
+        fs_cols=fs_cols, pairs_fs=pairs_fs, warm_start=warm_start,
+        search_train_np=X_str_fs.to_numpy(),
+        search_val_np=X_val_fs.to_numpy(),
+        outer_train_np=X_outer_fs.to_numpy(),
+        test_np=X_test_fs.to_numpy(),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CSV SAVE HELPER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _append_csv(row):
+    df = pd.DataFrame([row])
+    if os.path.exists(_CSV_PATH):
+        df.to_csv(_CSV_PATH, mode="a", header=False, index=False)
+    else:
+        df.to_csv(_CSV_PATH, mode="w", header=True, index=False)
+
 
 def _save_json(data, path):
-    """Save dict to JSON, skipping non-serialisable objects."""
     def _clean(obj):
-        if isinstance(obj, dict):
-            return {k: _clean(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [_clean(v) for v in obj]
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, (int, float, str, bool)) or obj is None:
-            return obj
-        return str(obj)   # models, circuits → skip gracefully
+        if isinstance(obj, dict):    return {k: _clean(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)): return [_clean(v) for v in obj]
+        if isinstance(obj, np.integer):   return int(obj)
+        if isinstance(obj, np.floating):  return float(obj)
+        return obj
     with open(path, "w") as f:
         json.dump(_clean(data), f, indent=2)
 
-def _append_csv(row: dict):
-    """Append a single result row to the benchmark CSV (creates if missing)."""
-    df_new = pd.DataFrame([row])
-    if os.path.exists(_CSV_PATH):
-        df_new.to_csv(_CSV_PATH, mode="a", header=False, index=False)
-    else:
-        df_new.to_csv(_CSV_PATH, mode="w", header=True, index=False)
+
+def _already_done(dataset, model_type, mode, metaheuristic, fs_method, reps):
+    if not os.path.exists(_CSV_PATH):
+        return False
+    try:
+        df = pd.read_csv(_CSV_PATH)
+        mask = (
+            (df["dataset"] == dataset) & (df["model_type"] == model_type) &
+            (df["mode"] == mode) & (df["metaheuristic"] == metaheuristic) &
+            (df["fs_method"] == fs_method) & (df["reps"] == reps)
+        )
+        return bool(mask.any())
+    except Exception:
+        return False
 
 
-# ═══════════════════════════════════════════════════════════════
-#  MAIN EXPERIMENT FUNCTION
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# OPTIMISER DISPATCH
+# ═════════════════════════════════════════════════════════════════════════════
 
-def run_experiment(
-    dataset,
-    option=1,
-    path=None,
-    # ── Model ─────────────────────────────────
-    model_type="qsvm",          # "qsvm" | "qnn"
-    mode="statevector",         # "statevector" | "noise" | "hardware"
-    reps=1,                     # feature-map repetitions         (R2-12)
-    # ── Feature selection ─────────────────────
-    use_fs=True,
-    fs_method="anova",          # "anova" | "mutual_info"         (R2-13)
-    k=5,
-    # ── Optimisation ──────────────────────────
-    metaheuristic="sa",         # "sa" | "ga"
-    # SA hyperparameters
-    sa_initial_temp=10.0,       # T0 raised: ~10× typical Δcost so the search
-                                # can escape local optima early. T0=1.0 was
-                                # too cold — the SA froze by iteration 3.
-    sa_cooling_rate=0.90,       # Slightly faster cooling to compensate for
-                                # the higher T0 within the iteration budget.
-    sa_stopping_temp=0.01,
-    sa_max_iterations=20,       # 20 iters × 5 neighbors = 100 evals — still
-    sa_num_neighbors=5,         # fast on statevector (~8 min/run).
-    # GA hyperparameters
-    ga_population_size=20,      # Larger population reduces premature convergence
-    ga_n_generations=10,        # More generations to compensate larger pop
-    ga_crossover_rate=0.8,
-    ga_mutation_rate=None,      # Defaults to 1/chromosome_length in GA code
-    ga_tournament_size=2,       # Lower pressure (was 3) → more diversity,
-                                # less risk of converging to a val-overfit
-    ga_elitism_count=2,         # Keep top-2 so good solutions aren't lost
-    ga_cv_folds=3,              # Internal CV folds for GA objective function.
-                                # 0 = use single val split (original behaviour).
-                                # >0 = use k-fold CV on train+val combined,
-                                # which prevents overfitting to the val split.
-    # ── Statistical rigor ─────────────────────
-    n_runs=5,                   # R1-03 + reviewer comment 3: multiple seeds
-    # ── Scope ─────────────────────────────────
-    run_baselines=True,         # linear / ring / full maps        (R1-02)
-    run_ablation=True,          # FS-only, Ent-only                (R1-07)
-):
+def _run_optimiser(metaheuristic, obj, n_pairs, cfg, seed, warm_start):
+    mh = cfg["metaheuristic"]
+    if mh == "sa":
+        return simulated_annealing(
+            obj, n_pairs,
+            initial_temp=cfg["sa_initial_temp"],
+            cooling_rate=cfg["sa_cooling_rate"],
+            stopping_temp=cfg["sa_stopping_temp"],
+            max_iterations=cfg["sa_max_iterations"],
+            num_neighbors=cfg["sa_num_neighbors"],
+            seed=seed,
+        )
+    if mh == "ts":
+        return tabu_search(
+            obj, n_pairs,
+            max_iterations=cfg["ts_max_iterations"],
+            tabu_tenure=cfg["ts_tabu_tenure"],
+            max_no_improve=cfg["ts_max_no_improve"],
+            neighborhood_sample_size=cfg["ts_neighborhood_sample_size"],
+            restart_fraction=cfg["ts_restart_fraction"],
+            seed=seed,
+        )
+    if mh == "ils":
+        return iterated_local_search(
+            obj, n_pairs,
+            n_restarts=cfg["ils_n_restarts"],
+            perturbation_strength=cfg["ils_perturbation_strength"],
+            local_search_iters=cfg["ils_local_search_iters"],
+            local_search_initial_temp=cfg["ils_local_search_initial_temp"],
+            local_search_cooling_rate=cfg["ils_local_search_cooling_rate"],
+            local_search_stopping_temp=cfg["ils_local_search_stopping_temp"],
+            local_search_num_neighbors=cfg["ils_local_search_num_neighbors"],
+            warm_start=warm_start if cfg.get("ils_use_warm_start") else None,
+            repair=cfg.get("ils_repair", True),
+            seed=seed,
+        )
+    if mh == "ga":
+        return genetic_algorithm(
+            obj, n_pairs,
+            population_size=cfg["ga_population_size"],
+            n_generations=cfg["ga_n_generations"],
+            crossover_rate=cfg["ga_crossover_rate"],
+            mutation_rate=cfg["ga_mutation_rate"],
+            tournament_size=cfg["ga_tournament_size"],
+            elitism_count=cfg["ga_elitism_count"],
+            seed=seed,
+        )
+    raise ValueError(f"Unknown metaheuristic: {mh}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN EXPERIMENT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_experiment(dataset, option, path, cfg):
     """
-    Full SEQUENT experiment.  See module docstring for parameter guide.
+    Run one SEQUENT experiment end-to-end and save results to CSV + JSON.
 
-    Statistical design
-    ------------------
-    Each of the n_runs repetitions uses seed = BASE_SEED + run_idx for BOTH
-    the train/val/test partition AND the metaheuristic.  This means every run
-    sees a genuinely different data split, making mean ± std / CI estimates
-    reflect uncertainty over unseen data rather than only metaheuristic variance.
-
-    After all runs, a paired Wilcoxon signed-rank test (and a paired t-test)
-    compare SEQUENT test accuracy against the SVM baseline evaluated on the
-    same splits.  Results are printed, saved to JSON and appended to the CSV.
+    Parameters
+    ----------
+    dataset : str
+    option  : int  (0=local file, 1=PMLB)
+    path    : str | None
+    cfg     : dict  (see EXPERIMENT GRID section for keys)
     """
+    mode           = cfg["mode"]
+    model_type     = cfg["model_type"]
+    metaheuristic  = cfg["metaheuristic"]
+    fs_method      = cfg["fs_method"]
+    k              = cfg["k"]
+    reps           = cfg["reps"]
+    n_runs         = cfg["n_runs"]
+    use_fs         = cfg.get("use_fs", True)
+    run_baselines  = cfg.get("run_baselines", True)
+    objective_metric = cfg.get("objective_metric", "accuracy")
+    backend_name   = cfg.get("backend_name", "ibm_pittsburgh")
+    hardware_shots = cfg.get("hardware_shots", 128)
+
     if model_type not in _EVALUATE:
         raise ValueError(f"model_type must be 'qsvm' or 'qnn'; got '{model_type}'")
     if mode not in _EVALUATE[model_type]:
         raise ValueError(f"mode must be 'statevector'|'noise'|'hardware'; got '{mode}'")
     if metaheuristic not in _OPTIMISER:
-        raise ValueError(f"metaheuristic must be 'sa' or 'ga'; got '{metaheuristic}'")
+        raise ValueError(f"metaheuristic must be sa/ts/ils/ga; got '{metaheuristic}'")
 
-    evaluate_fn = _EVALUATE[model_type][mode]
-    optimise    = _OPTIMISER[metaheuristic]
-    timestamp   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id      = f"{dataset}_{model_type}_{mode}_{metaheuristic}_{timestamp}"
-
-    _header(f"SEQUENT  |  {dataset}  |  {model_type.upper()}  |  {mode}  "
-            f"|  {metaheuristic.upper()}  |  FS:{use_fs}({fs_method},k={k})  "
-            f"|  reps={reps}  |  runs={n_runs}")
-
-    full_log = {
-        "run_id": run_id, "dataset": dataset, "model_type": model_type,
-        "mode": mode, "metaheuristic": metaheuristic, "use_fs": use_fs,
-        "fs_method": fs_method, "k": k, "reps": reps, "n_runs": n_runs,
-        "ga_cv_folds": ga_cv_folds if metaheuristic == "ga" else 0,
-        "base_seed": BASE_SEED,
-        "split_seeds": list(range(BASE_SEED, BASE_SEED + n_runs)),
-    }
-
-    # ── 1. Load raw data ───────────────────────────────────────────────────────
-    X_orig, y_orig = t.load_data(path=path, option=option, dataset=dataset)
-    print(f"\n  Dataset: {X_orig.shape[0]} samples × {X_orig.shape[1]} features")
-    print(f"  Class distribution: {dict(y_orig.value_counts().sort_index())}")
-    print(f"  Split seeds: {BASE_SEED} … {BASE_SEED + n_runs - 1}  "
-          f"(one distinct partition per run)")
-
-    # ── 2. Feature selection (done once on the full dataset) ──────────────────
-    # FS is applied to the full X/y before any split so that the selected
-    # feature subset is fixed across runs; only the train/val/test partition
-    # changes.  This mirrors the typical ML pipeline where the feature
-    # engineering step is frozen and cross-validation varies the split.
-    if use_fs:
-        print(f"\n  Applying FS: method={fs_method}, k={k}")
-        X_fs, fs_cols = t.apply_feature_selection(X_orig, y_orig,
-                                                   method=fs_method, k=k)
+    # Build evaluate function (wraps hardware/noise extras)
+    if mode == "hardware":
+        from functools import partial
+        evaluate_fn = partial(_EVALUATE[model_type][mode],
+                              shots=hardware_shots, backend_name=backend_name)
     else:
-        X_fs, fs_cols = X_orig, X_orig.columns
+        evaluate_fn = _EVALUATE[model_type][mode]
 
-    pairs_fs = t.createCouples(
-        t.transformCorrelations(X_fs.corr()), X_fs.columns)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = f"{dataset}_{model_type}_{mode}_{metaheuristic}_{fs_method}_reps{reps}_{timestamp}"
 
-    # ── 3. Baselines and ablation on the FIRST split only ────────────────────
-    # Baselines (linear/ring/full) and ablation components are deterministic
-    # given the data, so running them on the first split is representative.
-    # Their purpose is a qualitative comparison, not a statistical estimate.
-    first_seed = BASE_SEED  # split seed for the baseline/ablation split
+    _header(f"SEQUENT | {dataset} | {model_type.upper()} | {mode} | "
+            f"{metaheuristic.upper()} | FS:{use_fs}({fs_method},k={k}) | reps={reps} | runs={n_runs}")
 
-    X_tr_o, X_te_o, y_tr_o, y_te_o = t.splitData(
-        X_orig, y_orig, random_state=first_seed)
-    X_tr2_o, X_v_o, y_tr2_o, y_v_o = train_test_split(
-        X_tr_o, y_tr_o, test_size=0.2, random_state=first_seed)
-    tr_o   = X_tr2_o.to_numpy();  y_tr_o_np  = y_tr2_o.to_numpy()
-    val_o  = X_v_o.to_numpy();    y_val_o_np = y_v_o.to_numpy()
-    test_o = X_te_o.to_numpy();   y_te_o_np  = y_te_o.to_numpy()
+    X_orig, y_orig = t.load_data(path=path, option=option, dataset=dataset)
+    print(f"\n  Dataset: {X_orig.shape[0]} samples x {X_orig.shape[1]} features")
+    print(f"  Class distribution: {dict(sorted(Counter(y_orig).items()))}")
 
-    # ── 4. Classical baselines (first split) ──────────────────────────────────
-    _section("Baseline: Classical RBF-SVM  (raw features, test set, split 0)")
-    svm_m_first, svm_model_first = t.evaluate_classical_svm(
-        tr_o, y_tr_o_np, test_o, y_te_o_np)
-    _row("SVM test", svm_m_first)
+    # ── Classical baselines (split 0 only, for reference) ────────────────────
+    splits0 = _make_splits(X_orig, y_orig, BASE_SEED)
+    tr0_np  = splits0["outer_train_X"].to_numpy()
+    y_tr0   = splits0["outer_train_y"].to_numpy()
+    te0_np  = splits0["test_X"].to_numpy()
+    y_te0   = splits0["test_y"].to_numpy()
+
+    _section("Classical SVM baseline (split 0)")
+    svm_m0, _ = t.evaluate_classical_svm(tr0_np, y_tr0, te0_np, y_te0)
+    _row("SVM test", svm_m0)
     _section_end()
-    full_log["baseline_svm_split0"] = svm_m_first
 
-    # Classical MLP — evaluated only when model_type="qnn" so the paper has
-    # a direct classical-vs-quantum comparison for the neural network track.
-    mlp_m_first = None
+    mlp_m0 = None
     if model_type == "qnn":
-        _section("Baseline: Classical MLP  (raw features, test set, split 0)")
-        mlp_m_first, _ = t.evaluate_classical_mlp(
-            tr_o, y_tr_o_np, test_o, y_te_o_np, seed=first_seed)
-        _row("MLP test", mlp_m_first)
+        _section("Classical MLP baseline (split 0)")
+        mlp_m0, _ = t.evaluate_classical_mlp(tr0_np, y_tr0, te0_np, y_te0, seed=BASE_SEED)
+        _row("MLP test", mlp_m0)
         _section_end()
-        full_log["baseline_mlp_split0"] = mlp_m_first
 
-    # ── 5. Quantum entanglement baselines (all n_runs splits) ────────────────
-    # Running the baselines on the same n_runs splits as SEQUENT serves two
-    # purposes:
-    #   (a) Their mean ± std is directly comparable to SEQUENT's aggregated
-    #       metrics (same data partitions, apples-to-apples).
-    #   (b) The per-run accuracies are used for the paired Wilcoxon / t-test
-    #       against SEQUENT, which is the statistically meaningful comparison
-    #       in a quantum ML paper (not SEQUENT vs classical SVM).
-    # The best baseline for significance testing is Linear, as it is the most
-    # common reference in the QML feature-map literature.
+    # ── Quantum baselines (Linear, Ring, Full) ────────────────────────────────
+    # Baselines use all features (no FS) for methodological correctness.
+    # Each run uses a different seed matching the corresponding SEQUENT run,
+    # so pairs are valid for the Wilcoxon signed-rank test.
+    bl_test_accs = {k_: [] for k_ in _FM_FACTORY}
+    bl_test_all  = {k_: [] for k_ in _FM_FACTORY}
+
     if run_baselines:
-        baseline_results  = {}
-        # Accumulators for the n_runs loop — keyed by baseline name
-        _bl_all_test  = {"linear": [], "ring": [], "full": []}
-        _bl_run_logs  = {"linear": [], "ring": [], "full": []}
+        bl_session = (Session(backend=QiskitRuntimeService().backend(backend_name))
+                      if mode == "hardware" else nullcontext(None))
+        with bl_session as session:
+            for run_i in range(n_runs):
+                seed_i = BASE_SEED + run_i
+                sp = _make_splits(X_orig, y_orig, seed_i)
+                tr_np = sp["outer_train_X"].to_numpy()
+                y_tr  = sp["outer_train_y"].to_numpy()
+                te_np = sp["test_X"].to_numpy()
+                y_te  = sp["test_y"].to_numpy()
 
-        for run_idx_bl in range(n_runs):
-            seed_bl = BASE_SEED + run_idx_bl
-            # Raw-feature split for this run (same seeds as SEQUENT loop)
-            X_tr_bl, X_te_bl, y_tr_bl, y_te_bl = t.splitData(
-                X_orig, y_orig, random_state=seed_bl)
-            X_tr2_bl, X_v_bl, y_tr2_bl, y_v_bl = train_test_split(
-                X_tr_bl, y_tr_bl, test_size=0.2, random_state=seed_bl)
-            tr_bl   = X_tr2_bl.to_numpy();  y_tr_bl_np  = y_tr2_bl.to_numpy()
-            val_bl  = X_v_bl.to_numpy();    y_val_bl_np = y_v_bl.to_numpy()
-            test_bl = X_te_bl.to_numpy();   y_te_bl_np  = y_te_bl.to_numpy()
+                for bl_key, bl_factory in _FM_FACTORY.items():
+                    fm_bl = bl_factory(X_orig.shape[1], reps=reps)
+                    extra = {}
+                    if mode == "hardware":
+                        extra = dict(runtime_session=session,
+                                     job_tag=f"SEQUENT_BL_{dataset}_{model_type}_{bl_key}_run{run_i+1}")
+                    val_m, clf_bl = evaluate_fn(fm_bl, tr_np, y_tr, tr_np, y_tr, **extra)
+                    test_m = t.compute_metrics(clf_bl, te_np, y_te)
+                    bl_test_accs[bl_key].append(test_m["accuracy"])
+                    bl_test_all[bl_key].append(test_m)
+                    print(f"  [BL {bl_key:<6} run {run_i+1}/{n_runs}]  "
+                          f"test_acc={test_m['accuracy']:.4f}")
 
-            for name, fm_fn, key in [
-                ("Linear", t.createFeatureMapLinear, "linear"),
-                ("Ring",   t.createFeatureMapRing,   "ring"),
-                ("Full",   t.createFeatureMapFull,   "full"),
-            ]:
-                fm        = fm_fn(X_orig.shape[1], reps=reps)
-                val_m_bl, model_bl = evaluate_fn(fm, tr_bl, y_tr_bl_np,
-                                                  val_bl, y_val_bl_np)
-                test_m_bl = t.compute_metrics(model_bl, test_bl, y_te_bl_np)
-                _bl_all_test[key].append(test_m_bl)
-                _bl_run_logs[key].append({"seed": seed_bl, "test": test_m_bl})
-
-        # Print aggregated results + single-split detail for split-0
-        for name, key in [("Linear","linear"),("Ring","ring"),("Full","full")]:
-            agg_bl = _aggregate(_bl_all_test[key])
-            _section(f"Baseline: {name} Entanglement  "
-                     f"({n_runs} runs, raw features, mean ± std [95% CI])")
-            _row("test (aggregated)", agg_bl)
-            # Also show split-0 detail with circuit info (circuit is data-independent)
-            fm0 = {"linear": t.createFeatureMapLinear,
-                   "ring":   t.createFeatureMapRing,
-                   "full":   t.createFeatureMapFull}[key](X_orig.shape[1], reps=reps)
-            comp_bl = t.circuit_complexity(fm0)
-            per_cls_bl0 = t.compute_metrics_per_class(
-                evaluate_fn(fm0, tr_o, y_tr_o_np, val_o, y_val_o_np)[1],
-                test_o, y_te_o_np)
-            _class_rows(per_cls_bl0)
-            _circuit_row("circuit", comp_bl)
+        for bl_key in _FM_FACTORY:
+            agg = _aggregate(bl_test_all[bl_key])
+            fm0 = _FM_FACTORY[bl_key](X_orig.shape[1], reps=reps)
+            _section(f"Baseline: {bl_key.capitalize()} ({n_runs} runs)")
+            _row("test (aggregated)", agg)
+            _circuit_row("circuit", t.circuit_complexity(fm0))
             _section_end()
-            baseline_results[key] = {
-                "aggregated_test": agg_bl,
-                "runs":            _bl_run_logs[key],
-                "complexity":      comp_bl,
-            }
 
-        full_log["baselines"]        = baseline_results
-        full_log["baseline_linear_accs_per_run"] = [
-            r["test"]["accuracy"] for r in _bl_run_logs["linear"]]
-        full_log["baseline_ring_accs_per_run"] = [
-            r["test"]["accuracy"] for r in _bl_run_logs["ring"]]
-        full_log["baseline_full_accs_per_run"] = [
-            r["test"]["accuracy"] for r in _bl_run_logs["full"]]
+    # ── SEQUENT runs ──────────────────────────────────────────────────────────
+    _header(f"SEQUENT ({metaheuristic.upper()}, {n_runs} runs)")
 
-    # ── 6. Ablation (first split) ─────────────────────────────────────────────
-    X_tr_fs0, X_te_fs0, y_tr_fs0, y_te_fs0 = t.splitData(
-        X_fs, y_orig, random_state=first_seed)
-    X_tr2_fs0, X_v_fs0, y_tr2_fs0, y_v_fs0 = train_test_split(
-        X_tr_fs0, y_tr_fs0, test_size=0.2, random_state=first_seed)
-    tr_fs0   = X_tr2_fs0.to_numpy();  y_tr_fs0_np  = y_tr2_fs0.to_numpy()
-    val_fs0  = X_v_fs0.to_numpy();    y_val_fs0_np = y_v_fs0.to_numpy()
-    test_fs0 = X_te_fs0.to_numpy();   y_te_fs0_np  = y_te_fs0.to_numpy()
+    all_test, all_comp, all_cls = [], [], []
+    svm_accs_per_run, mlp_accs_per_run = [], []
+    run_logs = []
+    best_acc, best_solution = -1.0, None
 
-    if run_ablation:
-        ablation_log = {}
+    for run_i in range(n_runs):
+        seed_i = BASE_SEED + run_i
+        splits = _make_splits(X_orig, y_orig, seed_i)
+        fv = _prepare_fs_views(splits, use_fs, fs_method, k, seed_i)
 
-        # ── 6a. FS-only: all pairs, no search ─────────────────────────────
-        _section("Ablation: FS-only  (all pairs, no metaheuristic search, split 0)")
-        fm_all      = t.createFeatureMap(pairs_fs, X_fs.columns, reps=reps)
-        val_fs_only, m_fs_only = evaluate_fn(
-            fm_all, tr_fs0, y_tr_fs0_np, val_fs0, y_val_fs0_np)
-        tst_fs_only = t.compute_metrics(m_fs_only, test_fs0, y_te_fs0_np)
-        cls_fs_only = t.compute_metrics_per_class(m_fs_only, test_fs0, y_te_fs0_np)
-        cmp_fs_only = t.circuit_complexity(fm_all)
-        _row("validation", val_fs_only)
-        _row("test",       tst_fs_only)
-        _class_rows(cls_fs_only)
-        _circuit_row("circuit", cmp_fs_only)
-        _section_end()
-        ablation_log["fs_only"] = {
-            "val": val_fs_only, "test": tst_fs_only,
-            "per_class": cls_fs_only, "complexity": cmp_fs_only,
-        }
+        tr_np   = fv["search_train_np"]
+        y_tr    = splits["search_train_y"].to_numpy()
+        val_np  = fv["search_val_np"]
+        y_val   = splits["search_val_y"].to_numpy()
+        out_np  = fv["outer_train_np"]
+        y_out   = splits["outer_train_y"].to_numpy()
+        te_np   = fv["test_np"]
+        y_te    = splits["test_y"].to_numpy()
 
-        # ── 6b. Entanglement-only: search on raw features, no FS ──────────
-        _section("Ablation: Entanglement-only  (search on raw features, no FS, split 0)")
-        pairs_orig = t.createCouples(
-            t.transformCorrelations(X_orig.corr()), X_orig.columns)
-        cache_eo   = {}
-        _cv_eo     = ga_cv_folds if metaheuristic == "ga" else 0
-        obj_eo     = _build_objective(pairs_orig, X_orig.columns,
-                                       tr_o, y_tr_o_np, val_o, y_val_o_np,
-                                       evaluate_fn, reps, cache_eo,
-                                       cv_folds=_cv_eo)
-        if metaheuristic == "sa":
-            best_eo, _ = optimise(obj_eo, chromosome_length=len(pairs_orig),
-                                   initial_temp=sa_initial_temp,
-                                   cooling_rate=sa_cooling_rate,
-                                   stopping_temp=sa_stopping_temp,
-                                   max_iterations=sa_max_iterations,
-                                   num_neighbors=sa_num_neighbors,
-                                   seed=first_seed)
-        else:
-            best_eo, _ = optimise(obj_eo, chromosome_length=len(pairs_orig),
-                                   population_size=ga_population_size,
-                                   n_generations=ga_n_generations,
-                                   crossover_rate=ga_crossover_rate,
-                                   mutation_rate=ga_mutation_rate,
-                                   tournament_size=ga_tournament_size,
-                                   elitism_count=ga_elitism_count,
-                                   seed=first_seed)
-        info_eo      = cache_eo[str(best_eo)]
-        tst_eo       = t.compute_metrics(info_eo["model"], test_o, y_te_o_np)
-        cls_eo       = t.compute_metrics_per_class(info_eo["model"], test_o, y_te_o_np)
-        cmp_eo       = t.circuit_complexity(info_eo["feature_map"])
-        _row("validation", info_eo["metrics"])
-        _row("test",       tst_eo)
-        _class_rows(cls_eo)
-        _circuit_row("circuit", cmp_eo)
-        _section_end()
-        ablation_log["entanglement_only"] = {
-            "val": info_eo["metrics"], "test": tst_eo,
-            "per_class": cls_eo, "complexity": cmp_eo,
-        }
-        full_log["ablation"] = ablation_log
-
-    # ── 7. SEQUENT: FS + metaheuristic, n_runs independent seeds ─────────────
-    # KEY CHANGE (reviewer comment 3):
-    #   seed_i = BASE_SEED + run_idx is used for BOTH the data split AND the
-    #   metaheuristic, so each run is a truly independent experiment on a
-    #   different subset of the data.  The resulting mean ± std / CI is an
-    #   estimate of the model's generalisation performance, not just
-    #   metaheuristic variance.
-    _header(f"SEQUENT  ({metaheuristic.upper()}, {n_runs} independent runs, "
-            f"different split per run)")
-    all_val  = []; all_test  = []; all_comp  = []
-    all_cls  = []; run_logs  = []
-    svm_accs_per_run = []          # SVM re-evaluated on each run's split
-    mlp_accs_per_run = []          # MLP re-evaluated on each run's split (QNN only)
-    best_acc = -1.0; best_info = None
-
-    for run_idx in range(n_runs):
-        seed_i = BASE_SEED + run_idx
-        print(f"\n  ── Run {run_idx+1}/{n_runs}  (seed={seed_i}) "
-              f"──────────────────────────────────")
-
-        # ── Data split for this run ────────────────────────────────────────
-        X_tr_fs, X_te_fs, y_tr_fs, y_te_fs = t.splitData(
-            X_fs, y_orig, random_state=seed_i)
-        X_tr2_fs, X_v_fs, y_tr2_fs, y_v_fs = train_test_split(
-            X_tr_fs, y_tr_fs, test_size=0.2, random_state=seed_i)
-        tr_fs   = X_tr2_fs.to_numpy();  y_tr_fs_np  = y_tr2_fs.to_numpy()
-        val_fs  = X_v_fs.to_numpy();    y_val_fs_np = y_v_fs.to_numpy()
-        test_fs = X_te_fs.to_numpy();   y_te_fs_np  = y_te_fs.to_numpy()
-
-        # Re-evaluate classical SVM on the same split for a fair comparison
-        X_tr_raw, X_te_raw, y_tr_raw, y_te_raw = t.splitData(
-            X_orig, y_orig, random_state=seed_i)
-        X_tr2_raw, _, y_tr2_raw, _ = train_test_split(
-            X_tr_raw, y_tr_raw, test_size=0.2, random_state=seed_i)
-        svm_m_i, _ = t.evaluate_classical_svm(
-            X_tr2_raw.to_numpy(), y_tr2_raw.to_numpy(),
-            X_te_raw.to_numpy(),  y_te_raw.to_numpy())
+        # Classical per-run baselines
+        svm_m_i, _ = t.evaluate_classical_svm(out_np, y_out, te_np, y_te)
         svm_accs_per_run.append(svm_m_i["accuracy"])
 
-        # Re-evaluate classical MLP on the same split (QNN track only)
-        mlp_m_i = None
         if model_type == "qnn":
-            mlp_m_i, _ = t.evaluate_classical_mlp(
-                X_tr2_raw.to_numpy(), y_tr2_raw.to_numpy(),
-                X_te_raw.to_numpy(),  y_te_raw.to_numpy(),
-                seed=seed_i)
+            mlp_m_i, _ = t.evaluate_classical_mlp(out_np, y_out, te_np, y_te, seed=seed_i)
             mlp_accs_per_run.append(mlp_m_i["accuracy"])
 
-        # ── Metaheuristic search ───────────────────────────────────────────
-        cache = {}
-        # For the GA, use k-fold CV as the objective to prevent overfitting
-        # to the small validation split (high selection pressure + small n
-        # causes the GA to find entanglement maps that memorise val).
-        _cv = ga_cv_folds if metaheuristic == "ga" else 0
-        obj   = _build_objective(pairs_fs, X_fs.columns,
-                                  tr_fs, y_tr_fs_np, val_fs, y_val_fs_np,
-                                  evaluate_fn, reps, cache, cv_folds=_cv)
+        # Open hardware session per SEQUENT run if needed
+        seq_session = (Session(backend=QiskitRuntimeService().backend(backend_name))
+                       if mode == "hardware" else nullcontext(None))
 
-        if metaheuristic == "sa":
-            best_sol, _ = optimise(obj, chromosome_length=len(pairs_fs),
-                                    initial_temp=sa_initial_temp,
-                                    cooling_rate=sa_cooling_rate,
-                                    stopping_temp=sa_stopping_temp,
-                                    max_iterations=sa_max_iterations,
-                                    num_neighbors=sa_num_neighbors,
-                                    seed=seed_i)
-        else:
-            best_sol, _ = optimise(obj, chromosome_length=len(pairs_fs),
-                                    population_size=ga_population_size,
-                                    n_generations=ga_n_generations,
-                                    crossover_rate=ga_crossover_rate,
-                                    mutation_rate=ga_mutation_rate,
-                                    tournament_size=ga_tournament_size,
-                                    elitism_count=ga_elitism_count,
-                                    seed=seed_i)
+        with seq_session as session:
+            if mode == "hardware":
+                from functools import partial
+                search_fn = partial(evaluate_fn, fast_eval=True, runtime_session=session,
+                                    job_tag=f"SEQUENT_{dataset}_{model_type}_search_run{run_i+1}")
+            else:
+                search_fn = evaluate_fn
 
-        info      = cache[str(best_sol)]
-        val_m     = info["metrics"]
-        test_m    = t.compute_metrics(info["model"], test_fs, y_te_fs_np)
-        per_cls   = t.compute_metrics_per_class(info["model"], test_fs, y_te_fs_np)
-        comp      = t.circuit_complexity(info["feature_map"])
+            cache = {}
+            obj = _Objective(fv["pairs_fs"], fv["fs_cols"],
+                             tr_np, y_tr, val_np, y_val,
+                             search_fn, reps, cache,
+                             objective_metric=objective_metric)
 
-        all_val.append(val_m); all_test.append(test_m); all_comp.append(comp)
+            best_sol, _ = _run_optimiser(metaheuristic, obj,
+                                         len(fv["pairs_fs"]), cfg, seed_i,
+                                         fv["warm_start"])
+
+            # Final evaluation with full training set
+            selected_pairs = [fv["pairs_fs"][i] for i, b in enumerate(best_sol) if b == 1]
+            fm_final = t.createFeatureMap(selected_pairs, fv["fs_cols"], reps=reps)
+
+            if mode == "hardware":
+                final_m, final_model = evaluate_fn(
+                    fm_final, out_np, y_out, te_np, y_te,
+                    fast_eval=False, runtime_session=session,
+                    job_tag=f"SEQUENT_{dataset}_{model_type}_final_run{run_i+1}",
+                )
+            else:
+                final_m, final_model = evaluate_fn(fm_final, out_np, y_out, te_np, y_te)
+
+        test_m  = t.compute_metrics(final_model, te_np, y_te)
+        test_m["training_time"] = float(final_m.get("training_time", 0.0))
+        per_cls = t.compute_metrics_per_class(final_model, te_np, y_te)
+        comp    = t.circuit_complexity(fm_final)
+
+        all_test.append(test_m)
+        all_comp.append(comp)
         all_cls.append(per_cls)
 
-        _row(f"Run {run_idx+1} val",  val_m)
-        _row(f"Run {run_idx+1} test", test_m)
-        print(f"│  {'':22} SVM (same split): {svm_m_i['accuracy']:.4f}")
-        if mlp_m_i is not None:
-            print(f"│  {'':22} MLP (same split): {mlp_m_i['accuracy']:.4f}")
+        print(f"\n  -- Run {run_i + 1}/{n_runs}  (seed={seed_i})")
+        _row(f"Run {run_i+1} test", test_m)
+        print(f"|  {'':22} SVM: {svm_m_i['accuracy']:.4f}"
+              + (f"  MLP: {mlp_m_i['accuracy']:.4f}" if model_type == "qnn" else ""))
         _class_rows(per_cls)
-        _circuit_row(f"Run {run_idx+1} circuit", comp)
+        _circuit_row(f"Run {run_i+1} circuit", comp)
 
-        run_logs.append({"seed": seed_i,
-                         "val": val_m, "test": test_m,
-                         "svm_accuracy": svm_m_i["accuracy"],
-                         "mlp_accuracy": mlp_m_i["accuracy"] if mlp_m_i else None,
-                         "per_class": per_cls, "complexity": comp,
-                         "solution": info["solution"]})
+        run_logs.append(dict(seed=seed_i, test=test_m, per_class=per_cls,
+                             complexity=comp, solution=list(best_sol),
+                             svm_accuracy=svm_m_i["accuracy"],
+                             mlp_accuracy=mlp_m_i["accuracy"] if model_type == "qnn" else None))
 
-        if val_m["accuracy"] > best_acc:
-            best_acc  = val_m["accuracy"]
-            best_info = info
+        if test_m["accuracy"] > best_acc:
+            best_acc, best_solution = test_m["accuracy"], list(best_sol)
 
-    # ── 8. Aggregate across runs ──────────────────────────────────────────────
-    agg_val   = _aggregate(all_val)
-    agg_test  = _aggregate(all_test)
-    agg_comp  = _aggregate(all_comp)
+    # ── Aggregated results ───────────────────────────────────────────────────
+    agg_test = _aggregate(all_test)
+    agg_comp = _aggregate(all_comp)
 
-    _section(f"SEQUENT  —  Aggregated ({n_runs} runs, mean ± std [95% CI])")
-    _row("validation", agg_val)
-    _row("test",       agg_test)
+    _section(f"SEQUENT Aggregated ({n_runs} runs)")
+    _row("test", agg_test)
     _circuit_row("complexity", agg_comp)
-
-    if all_cls:
-        classes = all_cls[0].keys()
-        print(f"│  Per-class test metrics (mean ± std over {n_runs} runs):")
-        for cls in classes:
-            f1s = [r[cls]["f1"] for r in all_cls]
-            n   = len(f1s)
-            mu  = np.mean(f1s)
-            std = np.std(f1s, ddof=1)
-            ci  = float(sp_stats.t.ppf(0.975, df=max(n-1,1))) * std / np.sqrt(n)
-            print(f"│    class {cls:<6}  f1:{mu:.4f} ±{std:.4f} [95%CI ±{ci:.4f}]")
     _section_end()
 
-    # ── 9. Statistical significance ───────────────────────────────────────────
-    # Primary test: SEQUENT vs Linear entanglement baseline — the natural
-    # quantum-to-quantum comparison that justifies the contribution.
-    # Secondary test: SEQUENT vs classical SVM — kept for completeness but
-    # less meaningful as a main claim in a QML paper.
+    # ── Statistical significance ─────────────────────────────────────────────
     sequent_accs = [r["test"]["accuracy"] for r in run_logs]
 
-    sig_results_linear = {}
-    sig_results_ring   = {}
-    sig_results_full   = {}
-    if run_baselines:
-        for key, var_name, label in [
-            ("baseline_linear_accs_per_run", "sig_results_linear",
-             "SEQUENT vs Linear entanglement"),
-            ("baseline_ring_accs_per_run",   "sig_results_ring",
-             "SEQUENT vs Ring entanglement"),
-            ("baseline_full_accs_per_run",   "sig_results_full",
-             "SEQUENT vs Full entanglement"),
-        ]:
-            bl_accs = full_log.get(key, [])
-            if bl_accs:
-                result = _significance_tests(sequent_accs, bl_accs)
-                _print_significance_block(result, label)
-                if var_name == "sig_results_linear":
-                    sig_results_linear = result
-                elif var_name == "sig_results_ring":
-                    sig_results_ring = result
-                else:
-                    sig_results_full = result
+    sig_results = {}
+    for bl_key in _FM_FACTORY:
+        if bl_test_accs[bl_key]:
+            sig_results[bl_key] = _significance_tests(sequent_accs, bl_test_accs[bl_key])
+            _print_significance(sig_results[bl_key], f"SEQUENT vs {bl_key.capitalize()}")
 
-    sig_results  = _significance_tests(sequent_accs, svm_accs_per_run)
-    _print_significance_block(
-        sig_results,
-        "SEQUENT vs classical SVM — reference")
+    sig_svm = _significance_tests(sequent_accs, svm_accs_per_run)
+    _print_significance(sig_svm, "SEQUENT vs classical SVM")
 
-    sig_results_mlp = {}
+    sig_mlp = {}
     if model_type == "qnn" and mlp_accs_per_run:
-        sig_results_mlp = _significance_tests(sequent_accs, mlp_accs_per_run)
-        _print_significance_block(sig_results_mlp, "QNN vs classical MLP")
+        sig_mlp = _significance_tests(sequent_accs, mlp_accs_per_run)
+        _print_significance(sig_mlp, "QNN vs classical MLP")
 
-    # ── 10. Save results ──────────────────────────────────────────────────────
-    full_log.update({
-        "aggregated_val":        agg_val,
-        "aggregated_test":       agg_test,
-        "aggregated_complexity": agg_comp,
-        "runs":                  run_logs,
-        "svm_accs_per_run":      svm_accs_per_run,
-        "mlp_accs_per_run":      mlp_accs_per_run if mlp_accs_per_run else None,
-        "significance_tests_vs_linear": sig_results_linear if sig_results_linear else None,
-        "significance_tests_vs_ring":   sig_results_ring   if sig_results_ring   else None,
-        "significance_tests_vs_full":   sig_results_full   if sig_results_full   else None,
-        "significance_tests_vs_svm":    sig_results,
-        "significance_tests_mlp":       sig_results_mlp if sig_results_mlp else None,
-        "best_solution":         best_info["solution"] if best_info else None,
-    })
+    # ── Save ─────────────────────────────────────────────────────────────────
+    full_log = dict(
+        run_id=run_id, dataset=dataset, model_type=model_type, mode=mode,
+        metaheuristic=metaheuristic, fs_method=fs_method, k=k, reps=reps,
+        n_runs=n_runs, objective_metric=objective_metric,
+        hardware_shots=hardware_shots if mode == "hardware" else None,
+        backend_name=backend_name if mode == "hardware" else None,
+        aggregated_test=agg_test, aggregated_complexity=agg_comp,
+        runs=run_logs,
+        svm_accs_per_run=svm_accs_per_run,
+        mlp_accs_per_run=mlp_accs_per_run or None,
+        baseline_test_accs=bl_test_accs,
+        significance_vs_baselines=sig_results,
+        significance_vs_svm=sig_svm,
+        significance_vs_mlp=sig_mlp or None,
+        best_solution=best_solution,
+    )
 
     json_path = os.path.join("results", f"{run_id}.json")
     _save_json(full_log, json_path)
     print(f"\n  Full log → {json_path}")
 
-    csv_row = {
-        "run_id":              run_id,
-        "dataset":             dataset,
-        "model_type":          model_type,
-        "mode":                mode,
-        "metaheuristic":       metaheuristic,
-        "fs_method":           fs_method if use_fs else "none",
-        "k":                   k if use_fs else X_orig.shape[1],
-        "reps":                reps,
-        "n_runs":              n_runs,
-        "ga_cv_folds":         ga_cv_folds if metaheuristic == "ga" else 0,
-        # SVM baseline (split-0 reference)
-        "svm_test_acc_split0": svm_m_first["accuracy"],
-        "svm_test_f1_split0":  svm_m_first["f1_macro"],
-        # SVM re-evaluated per run (mean across runs)
-        "svm_acc_mean":        float(np.mean(svm_accs_per_run)),
-        "svm_acc_std":         float(np.std(svm_accs_per_run, ddof=1)),
-        # MLP re-evaluated per run — only populated for model_type="qnn"
-        "mlp_acc_mean":        float(np.mean(mlp_accs_per_run)) if mlp_accs_per_run else None,
-        "mlp_acc_std":         float(np.std(mlp_accs_per_run, ddof=1)) if mlp_accs_per_run else None,
-        "mlp_wilcoxon_p":      sig_results_mlp.get("wilcoxon_p",   float("nan")) if sig_results_mlp else None,
-        "mlp_wilcoxon_sig_05": sig_results_mlp.get("wilcoxon_sig_05", False)     if sig_results_mlp else None,
-        # SEQUENT aggregated
-        "val_acc_mean":        agg_val.get("accuracy_mean", 0),
-        "val_acc_std":         agg_val.get("accuracy_std",  0),
-        "val_acc_ci95":        agg_val.get("accuracy_ci95", 0),
-        "val_f1_mean":         agg_val.get("f1_macro_mean", 0),
-        "test_acc_mean":       agg_test.get("accuracy_mean", 0),
-        "test_acc_std":        agg_test.get("accuracy_std",  0),
-        "test_acc_ci95":       agg_test.get("accuracy_ci95", 0),
-        "test_f1_mean":        agg_test.get("f1_macro_mean", 0),
-        "test_f1_std":         agg_test.get("f1_macro_std",  0),
-        "test_f1_ci95":        agg_test.get("f1_macro_ci95", 0),
-        "depth_mean":          agg_comp.get("depth_mean",    0),
-        "two_qubit_gates_mean":agg_comp.get("two_qubit_gates_mean", 0),
-        "train_time_mean":     agg_val.get("training_time_mean", 0),
-        # Significance — quantum baselines (linear / ring / full)
-        "linear_perm_p":       sig_results_linear.get("permutation_p",      float("nan")) if sig_results_linear else None,
-        "linear_perm_sig_05":  sig_results_linear.get("permutation_sig_05", False)        if sig_results_linear else None,
-        "linear_sign_p":       sig_results_linear.get("sign_p",             float("nan")) if sig_results_linear else None,
-        "linear_ttest_p":      sig_results_linear.get("ttest_p",            float("nan")) if sig_results_linear else None,
-        "ring_perm_p":         sig_results_ring.get("permutation_p",      float("nan")) if sig_results_ring else None,
-        "ring_perm_sig_05":    sig_results_ring.get("permutation_sig_05", False)        if sig_results_ring else None,
-        "ring_sign_p":         sig_results_ring.get("sign_p",             float("nan")) if sig_results_ring else None,
-        "ring_ttest_p":        sig_results_ring.get("ttest_p",            float("nan")) if sig_results_ring else None,
-        "full_perm_p":         sig_results_full.get("permutation_p",      float("nan")) if sig_results_full else None,
-        "full_perm_sig_05":    sig_results_full.get("permutation_sig_05", False)        if sig_results_full else None,
-        "full_sign_p":         sig_results_full.get("sign_p",             float("nan")) if sig_results_full else None,
-        "full_ttest_p":        sig_results_full.get("ttest_p",            float("nan")) if sig_results_full else None,
-        # Significance — reference: SEQUENT vs classical SVM
-        "svm_perm_p":          sig_results.get("permutation_p",      float("nan")),
-        "svm_perm_sig_05":     sig_results.get("permutation_sig_05", False),
-        "svm_sign_p":          sig_results.get("sign_p",             float("nan")),
-        "svm_ttest_p":         sig_results.get("ttest_p",            float("nan")),
-        "timestamp":           timestamp,
-    }
+    csv_row = dict(
+        run_id=run_id, dataset=dataset, model_type=model_type, mode=mode,
+        metaheuristic=metaheuristic, fs_method=fs_method if use_fs else "none",
+        k=k if use_fs else X_orig.shape[1], reps=reps, n_runs=n_runs,
+        hardware_shots=hardware_shots if mode == "hardware" else None,
+        backend_name=backend_name if mode == "hardware" else None,
+        objective_metric=objective_metric,
+        svm_acc_mean=float(np.mean(svm_accs_per_run)),
+        mlp_acc_mean=float(np.mean(mlp_accs_per_run)) if mlp_accs_per_run else None,
+        **{f"{bl_key}_test_acc_mean": float(np.mean(bl_test_accs[bl_key])) if bl_test_accs[bl_key] else None
+           for bl_key in _FM_FACTORY},
+        test_acc_mean=agg_test.get("accuracy_mean", 0),
+        test_acc_std=agg_test.get("accuracy_std", 0),
+        test_acc_ci95=agg_test.get("accuracy_ci95", 0),
+        test_f1_mean=agg_test.get("f1_macro_mean", 0),
+        depth_mean=agg_comp.get("depth_mean", 0),
+        two_qubit_gates_mean=agg_comp.get("two_qubit_gates_mean", 0),
+        timestamp=timestamp,
+    )
     _append_csv(csv_row)
-    print(f"  Summary → {_CSV_PATH}")
-
+    print(f"  Summary  → {_CSV_PATH}")
     return full_log
 
 
-# ═══════════════════════════════════════════════════════════════
-#  BENCHMARK ENTRY POINT
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# EXPERIMENT GRID  ← edit this section to configure experiments
+# ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
 
-    # ── Dataset manifest ──────────────────────────────────────────────────────
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    # Each entry: (name, option, path)
+    #   option=0 → local file at path
+    #   option=1 → PMLB dataset (path ignored)
     DATASETS = [
-        ("corral",              1, None),
-        ("breast-w",            0, "./datasets/breast-w.tsv"),
-        ("fitness_class_2212",  0, "./datasets/fitness_class_2212.csv"),
-        ("flare",               0, "./datasets/flare.tsv"),
-        ("heart",               0, "./datasets/heart.csv"),
+        ("flare",  0, "./datasets/flare.tsv"),
+        # ("corral", 1, None),
+        # ("breast-w", 0, "./datasets/breast-w.tsv"),
+        # ("heart",   0, "./datasets/heart.csv"),
+	# ("fitness_class_2212", 0, "./datasets/fitness_class_2212.csv"),
     ]
 
-    # ── Experiment grid ───────────────────────────────────────────────────────
-    # Full factorial design:
-    #   model_type : qsvm, qnn              (2)
-    #   metaheuristic: sa, ga               (2)
-    #   fs_method  : anova, autoencoder     (2)
-    #   reps       : 1, 3, 5               (3)
-    #   n_runs     : 5  (fixed)
-    #   k          : 5  (fixed)
-    #   Total      : 2×2×2×3 = 24 configs × 5 datasets = 120 experiments
-    #
-    # run_baselines=True only on reps=1 configs — baselines use fixed
-    # entanglement and don't depend on reps, so running them once is enough.
-    # run_ablation=True only on reps=1 + anova + sa (the canonical setting).
-    #
-    # SA defaults inherited from function signature:
-    #   sa_initial_temp=10.0, sa_cooling_rate=0.90,
-    #   sa_max_iterations=20, sa_num_neighbors=5
-    # GA defaults inherited from function signature:
-    #   ga_population_size=20, ga_n_generations=10,
-    #   ga_tournament_size=2,  ga_cv_folds=3
+    # ── Execution mode ────────────────────────────────────────────────────────
+    # "statevector"  → ideal simulator (fastest, local testing)
+    # "noise"        → noise-model simulator (requires IBM account)
+    # "hardware"     → real IBM backend (requires IBM account + credits)
+    MODE = os.environ.get("SEQUENT_MODE", "noise")
 
-    _MODELS = ["qsvm", "qnn"]
-    _MHS    = ["sa", "ga"]
-    _FS     = ["anova", "autoencoder"]
-    _REPS   = [1, 3, 5]
+    # ── Reps grid ─────────────────────────────────────────────────────────────
+    REPS_GRID = [1, 2, 3]
 
-    CONFIGS = []
-    for _model in _MODELS:
-        for _mh in _MHS:
-            for _fs in _FS:
-                for _reps in _REPS:
-                    # Baselines (linear/ring/full) only on reps=1 — they are
-                    # independent of reps so one evaluation is sufficient.
-                    _baselines = (_reps == 1)
-                    # Ablation only on the canonical config: reps=1, anova, SA.
-                    # Running ablation for every combination would be redundant
-                    # and very expensive.
-                    _ablation  = (_reps == 1 and _fs == "anova" and _mh == "sa")
-                    CONFIGS.append(dict(
-                        model_type    = _model,
-                        mode          = "statevector",
-                        metaheuristic = _mh,
-                        use_fs        = True,
-                        fs_method     = _fs,
-                        k             = 5,
-                        reps          = _reps,
-                        n_runs        = 5,
-                        run_baselines = _baselines,
-                        run_ablation  = _ablation,
-                    ))
+    # ── Default config ────────────────────────────────────────────────────────
+    # Override individual keys per-dataset/model in the loop below if needed.
+    DEFAULT_CFG = dict(
+        mode=MODE,
+        model_type="qsvm",        # "qsvm" | "qnn"
+        metaheuristic="sa",       # "sa" | "ils" 
+        use_fs=True,
+        fs_method="anova",        # "anova" | "mutual_info" | "autoencoder"
+        k=5,
+        reps=1,                   # overridden per job from REPS_GRID
+        n_runs=10,
+        run_baselines=True,
+        objective_metric="accuracy",  # overridden to "f1_macro" for imbalanced
 
-    # Quick sanity-check: print the grid before running
-    print(f"\n  Experiment grid: {len(CONFIGS)} configs × {len(DATASETS)} datasets "
-          f"= {len(CONFIGS)*len(DATASETS)} experiments\n")
-    _header_cols = f"{'model':<6} {'mh':<4} {'fs':<12} {'reps':<5} {'baselines':<10} {'ablation'}"
-    print(f"  {_header_cols}")
-    print(f"  {'-'*55}")
-    for _c in CONFIGS:
-        print(f"  {_c['model_type']:<6} {_c['metaheuristic']:<4} "
-              f"{_c['fs_method']:<12} {_c['reps']:<5} "
-              f"{str(_c['run_baselines']):<10} {_c['run_ablation']}")
-    print()
+        # SA hyperparameters
+        sa_initial_temp=10.0,
+        sa_cooling_rate=0.90,
+        sa_stopping_temp=0.01,
+        sa_max_iterations=10,
+        sa_num_neighbors=5,
 
-    for ds, opt, p in DATASETS:
-        for cfg in CONFIGS:
-            try:
-                run_experiment(
-                    dataset=ds, option=opt, path=p,
-                    **cfg,
-                )
-            except Exception as e:
-                print(f"\n  [ERROR] {ds} / {cfg['model_type']} / {cfg['mode']} : {e}")
-                import traceback
-                traceback.print_exc()
+        # ILS hyperparameters
+        ils_n_restarts=3,
+        ils_perturbation_strength=0.3,
+        ils_local_search_iters=15,
+        ils_local_search_initial_temp=5.0,
+        ils_local_search_cooling_rate=0.85,
+        ils_local_search_stopping_temp=1e-3,
+        ils_local_search_num_neighbors=3,
+        ils_use_warm_start=True,
+        ils_repair=True,
+
+        # Hardware settings
+        hardware_shots=512,
+        backend_name="ibm_pittsburgh",
+    )
+
+    # ── Build job list ────────────────────────────────────────────────────────
+    IMBALANCE_THRESHOLD = 1.5
+
+    jobs = []
+    for ds, opt, path in DATASETS:
+        try:
+            _, y_ds = t.load_data(path=path, option=opt, dataset=ds)
+            counts = Counter(y_ds)
+            ir = max(counts.values()) / min(counts.values())
+            imbalanced = ir > IMBALANCE_THRESHOLD
+            print(f"  [{ds}] IR={ir:.2f} → {'f1_macro' if imbalanced else 'accuracy'}")
+        except Exception as e:
+            print(f"  [WARN] Could not pre-load {ds}: {e}. Defaulting to accuracy.")
+            imbalanced = False
+
+        for model_type in ["qsvm", "qnn"]:
+            for mh in ["sa", "ils"]:
+                for fs in ["anova", "autoencoder"]:
+                    for rep in REPS_GRID:
+                        cfg = dict(DEFAULT_CFG)
+                        cfg["model_type"] = model_type
+                        cfg["metaheuristic"] = mh
+                        cfg["fs_method"] = fs
+                        cfg["reps"] = rep
+                        if imbalanced:
+                            cfg["objective_metric"] = "f1_macro"
+                        jobs.append((ds, opt, path, cfg))
+
+    # ── Optional: filter to a single job index (for SLURM array jobs) ─────────
+    job_idx_env = os.environ.get("SEQUENT_JOB_INDEX", "").strip()
+    if job_idx_env:
+        jobs = [jobs[int(job_idx_env)]]
+        print(f"  Running single job index {job_idx_env}")
+    else:
+        print(f"  Running full grid: {len(jobs)} jobs")
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+    for ds, opt, path, cfg in jobs:
+        if _already_done(ds, cfg["model_type"], cfg["mode"],
+                         cfg["metaheuristic"], cfg["fs_method"], cfg["reps"]):
+            print(f"  [SKIP] {ds}/{cfg['model_type']}/{cfg['metaheuristic']}/{cfg['fs_method']} already in CSV")
+            continue
+
+        print(f"\n  Running: {ds} / {cfg['model_type']} / {cfg['metaheuristic']} / {cfg['fs_method']}")
+        try:
+            run_experiment(ds, opt, path, cfg)
+        except Exception as e:
+            import traceback
+            print(f"\n  [ERROR] {ds}/{cfg['model_type']}: {e}")
+            traceback.print_exc()

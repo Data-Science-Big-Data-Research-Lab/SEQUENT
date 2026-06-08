@@ -135,7 +135,7 @@ Results are saved automatically:
 | `k` | `5` | Number of features to keep when `use_fs=True` |
 | `metaheuristic` | `"sa"` | `"sa"` (Simulated Annealing) or `"ils"` (Iterated Local Search) |
 | `n_runs` | `10` | Independent runs with different data splits for statistical reporting |
-| `run_baselines` | `True` | Evaluate linear / ring / full entanglement baselines (all features, no FS) |
+| `run_baselines` | `True` | Evaluate linear / ring / full entanglement baselines |
 | `objective_metric` | `"accuracy"` | `"accuracy"` or `"f1_macro"` (auto-set for imbalanced datasets) |
 
 ### SA hyperparameters

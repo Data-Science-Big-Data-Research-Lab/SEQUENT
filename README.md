@@ -166,15 +166,7 @@ Results are saved automatically:
 
 ## Statistical Rigor
 
-Each of the `n_runs` repetitions uses `seed = BASE_SEED + run_idx` for **both** the train/val/test partition and the metaheuristic. This means every run sees a genuinely different data split, making reported mean ± std and 95% CI estimates reflect model uncertainty over unseen data, not just metaheuristic variance. This design is equivalent to repeated random sub-sampling.
-
-### Confidence intervals
-
-All aggregated metrics report a **95% confidence interval** computed using the t-distribution with `n_runs − 1` degrees of freedom:
-
-```
-CI₉₅ = t₀.₉₇₅(n−1) × std / √n
-```
+Each of the `n_runs` repetitions uses `seed = BASE_SEED + run_idx` for **both** the train/val/test partition and the metaheuristic. This means every run sees a genuinely different data split, making reported mean ± std estimates reflect model uncertainty over unseen data, not just metaheuristic variance. This design is equivalent to repeated random sub-sampling.
 
 ### Significance test
 
@@ -204,10 +196,8 @@ The full factorial experiment covers all combinations of:
 | Metaheuristic | `sa`, `ils` |
 | Feature selection | `anova`, `autoencoder` |
 | Reps | `1`, `2`, `3` |
-| n\_runs | `10` (fixed) |
-| k | `5` (fixed) |
-
-This produces **24 configurations × 5 datasets = 120 experiments**.
+| n\_runs | `10` |
+| k | `5` |
 
 Each configuration is run as an independent job. The `SEQUENT_JOB_INDEX` environment variable can be used to run a single job from the grid, enabling parallelisation via SLURM array jobs.
 
@@ -219,11 +209,9 @@ Each configuration is run as an independent job. The `SEQUENT_JOB_INDEX` environ
 |---|---|---|---|---|
 | Corral | 160 | 6 | 56% / 44% | PMLB |
 | BreastW | 699 | 9 | 63% benign / 37% malignant | Local TSV |
-| Fitness | 1500 | 6 | 70% class 1 / 30% class 0 | Local CSV |
-| Flare | ~1066 | **11** | varies | Local TSV |
-| Heart | 918 | varies | 44% normal / 56% disease | Local CSV |
-
-> **Note on Flare**: the deprecated version of the dataset is used, which contains **11 features**. Some mirrors of the dataset report 10 features; the version used here is the original with the additional attribute included.
+| Fitness | 1500 | 7 | 70% class 1 / 30% class 0 | Local CSV |
+| Flare | 1066 | 10 | varies | Local TSV |
+| Heart | 918 | 11 | 44% normal / 56% disease | Local CSV |
 
 Three datasets (BreastW, Fitness, Heart) are class-imbalanced. For these, accuracy alone is insufficient — the paper reports and analyses macro-averaged precision, recall and F1, as well as per-class breakdowns. The objective metric is automatically set to `f1_macro` for datasets with imbalance ratio > 1.5.
 
@@ -233,7 +221,7 @@ Three datasets (BreastW, Fitness, Heart) are class-imbalanced. For these, accura
 
 ### PegasosQSVC (QSVM)
 
-The default model. Uses a `FidelityQuantumKernel` built on the SEQUENT feature map, optimised with the Pegasos SGD-SVM algorithm (`C=1000`, `num_steps=100`).
+The default model. Uses a `FidelityQuantumKernel` built on the SEQUENT feature map, optimised with the Pegasos SGD-SVM algorithm (`C=1000`, `num_steps=500`).
 
 ### NeuralNetworkClassifier (QNN)
 
@@ -313,9 +301,8 @@ Multi-run experiments offset the seed by run index (`BASE_SEED + run_idx`) for *
 @article{sequent2025,
   title   = {Selective Qubit Entanglement for Efficient Quantum Feature Map Construction},
   author  = {F. Rodríguez-Díaz and D. Gutiérrez-Avilés and A. Troncoso and F. Martínez-Álvarez},
-  journal = {Quantum Machine Intelligence},
-  year    = {2025},
-  publisher = {Springer Nature}
+  journal = {},
+  year    = {2025}
 }
 ```
 -->

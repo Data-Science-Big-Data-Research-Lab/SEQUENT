@@ -178,11 +178,7 @@ After all runs complete, a **one-sided Wilcoxon signed-rank test** (H₁: SEQUEN
 
 The comparison against the classical SVM is also reported for reference, but the **primary statistical claim** is the quantum-to-quantum comparison (SEQUENT vs linear / ring / full entanglement).
 
-When `model_type="qnn"`, an additional paired Wilcoxon test compares the QNN against the classical MLP baseline.
-
 Results are printed to console and saved to the JSON log and CSV.
-
-> **Note on baselines**: quantum baselines (linear, ring, full) are evaluated on the **full feature set without any feature selection**, matching their original definition. SEQUENT is evaluated on the FS-reduced feature set. Both use the same 10 data splits, ensuring valid pairing for the Wilcoxon test.
 
 ---
 

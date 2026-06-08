@@ -209,7 +209,7 @@ Each configuration is run as an independent job. The `SEQUENT_JOB_INDEX` environ
 | Flare | 1066 | 10 | varies | Local TSV |
 | Heart | 918 | 11 | 44% normal / 56% disease | Local CSV |
 
-Three datasets (BreastW, Fitness, Heart) are class-imbalanced. For these, accuracy alone is insufficient — the paper reports and analyses macro-averaged precision, recall and F1, as well as per-class breakdowns. The objective metric is automatically set to `f1_macro` for datasets with imbalance ratio > 1.5.
+Three datasets (BreastW, Fitness) are class-imbalanced. For these, accuracy alone is insufficient — the paper reports and analyses macro-averaged precision, recall and F1, as well as per-class breakdowns. The objective metric is automatically set to `f1_macro` for datasets with imbalance ratio > 1.5.
 
 ---
 

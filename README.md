@@ -231,7 +231,7 @@ A parameterised quantum circuit composed of the SEQUENT feature map followed by 
 
 ### Classical MLP baseline (QNN track only)
 
-When `model_type="qnn"`, a shallow classical MLP is evaluated on every split alongside the QNN. The architecture (Linear → 64 → 32 → n\_classes, BatchNorm + ReLU + Dropout) is deliberately comparable in depth to the quantum circuits, ensuring a fair classical-vs-quantum comparison. Training uses Adam with early stopping on a 10% held-out split. A paired Wilcoxon significance test (SEQUENT QNN vs MLP) is computed and saved alongside the quantum baseline comparisons.
+When `model_type="qnn"`, a shallow classical MLP is evaluated on every split alongside the QNN. The architecture (Linear → 64 → 32 → n\_classes, BatchNorm + ReLU + Dropout) is deliberately comparable in depth to the quantum circuits, ensuring a fair classical-vs-quantum comparison. Training uses Adam with early stopping on a 10% held-out split.
 
 ---
 

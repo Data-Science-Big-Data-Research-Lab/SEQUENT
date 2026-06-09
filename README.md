@@ -176,8 +176,6 @@ After all runs complete, a **one-sided Wilcoxon signed-rank test** (H₁: SEQUEN
 |---|---|---|
 | **Wilcoxon signed-rank** | Non-parametric, paired | Primary test. Ranks the magnitudes of paired differences; more powerful than the sign test and does not assume normality |
 
-The comparison against the classical SVM is also reported for reference, but the **primary statistical claim** is the quantum-to-quantum comparison (SEQUENT vs linear / ring / full entanglement).
-
 Results are printed to console and saved to the JSON log and CSV.
 
 ---

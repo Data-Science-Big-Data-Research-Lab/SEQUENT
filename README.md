@@ -201,13 +201,11 @@ Each configuration is run as an independent job. The `SEQUENT_JOB_INDEX` environ
 
 | Dataset | Samples | Features | Class balance | Source |
 |---|---|---|---|---|
-| Corral | 160 | 6 | 56% / 44% | PMLB |
-| BreastW | 699 | 9 | 63% benign / 37% malignant | Local TSV |
-| Fitness | 1500 | 7 | 70% class 1 / 30% class 0 | Local CSV |
-| Flare | 1066 | 10 | varies | Local TSV |
-| Heart | 918 | 11 | 44% normal / 56% disease | Local CSV |
-
-Three datasets (BreastW, Fitness) are class-imbalanced. For these, accuracy alone is insufficient — the paper reports and analyses macro-averaged precision, recall and F1, as well as per-class breakdowns. The objective metric is automatically set to `f1_macro` for datasets with imbalance ratio > 1.5.
+| Corral | 160 | 6 | 56.3% Class 0 / 43.8% Class 1 | PMLB |
+| BreastW | 699 | 9 | 65.5% class 0 / 35.4% Class 1 | Local TSV |
+| Fitness | 1500 | 7 | 69.7% class 0 / 30.3% class 1 | Local CSV |
+| Flare | 1066 | 10 | 82.9% Class 0 / 17.1% Class 1 | Local TSV |
+| Heart | 918 | 11 | 44.7% Class 0 / 55.3% Class 1 | Local CSV |
 
 ---
 
@@ -215,21 +213,11 @@ Three datasets (BreastW, Fitness) are class-imbalanced. For these, accuracy alon
 
 ### PegasosQSVC (QSVM)
 
-The default model. Uses a `FidelityQuantumKernel` built on the SEQUENT feature map, optimised with the Pegasos SGD-SVM algorithm (`C=1000`, `num_steps=500`).
+The default model. Uses a `FidelityQuantumKernel` built on the SEQUENT feature map, optimised with the Pegasos SGD-SVM algorithm (`C=100`, `num_steps=50`).
 
 ### NeuralNetworkClassifier (QNN)
 
 A parameterised quantum circuit composed of the SEQUENT feature map followed by a `TwoLocal` ansatz (Ry + Rz rotations, CX linear entanglement). Trained with COBYLA (maxiter=100).
-
-| Mode | Backend | Notes |
-|---|---|---|
-| `statevector` | Default Qiskit sampler | No noise, fastest |
-| `noise` | `AerSimulator` + IBM noise model | GPU-accelerated via tensor network method |
-| `hardware` | Real IBM Quantum device | ALAP scheduling + XX dynamical decoupling |
-
-### Classical MLP baseline (QNN track only)
-
-When `model_type="qnn"`, a shallow classical MLP is evaluated on every split alongside the QNN. The architecture (Linear → 64 → 32 → n\_classes, BatchNorm + ReLU + Dropout) is deliberately comparable in depth to the quantum circuits, ensuring a fair classical-vs-quantum comparison. Training uses Adam with early stopping on a 10% held-out split.
 
 ---
 
@@ -258,9 +246,9 @@ Every experiment reports the following metrics on the test set:
 | Metric | Why it matters |
 |---|---|
 | Accuracy | Overall correctness |
-| Precision (macro) | Per-class average — not dominated by majority class |
-| Recall (macro) | Per-class average — critical for imbalanced datasets |
-| F1 (macro) | Harmonic mean of precision and recall |
+| Precision | |
+| Recall |  |
+| F1  | Harmonic mean of precision and recall |
 | Per-class breakdown | Precision / recall / F1 / support for each class individually |
 | Training time | Seconds |
 | Inference time | Seconds |
@@ -268,8 +256,6 @@ Every experiment reports the following metrics on the test set:
 | Total gates | Resource cost |
 | Two-qubit gates | Primary source of noise in NISQ devices |
 | Search space size | 2^C(k,2) — scalability analysis |
-
-Macro averaging is used throughout because three of the five datasets are class-imbalanced. Per-class metrics are logged to JSON, printed to console and averaged with ± std and 95% CI across runs.
 
 ---
 
